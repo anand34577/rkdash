@@ -1,0 +1,33 @@
+# Build output
+/dist/
+/rkdash
+/rkdash-linux-arm64
+*.exe
+*.test
+
+# Go build/test artifacts
+*.out
+*.prof
+
+# Go workspace files (local multi-module setups)
+go.work
+go.work.sum
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment/secrets
+.env
+.env.*
+
+# Claude Code account/session launcher (local machine config, not project source)
+Claude-Account-1.cmd
