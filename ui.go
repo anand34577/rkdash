@@ -16,9 +16,10 @@ var (
 	colorIO      = tcell.NewHexColor(0xd9a441)
 	colorProcess = tcell.NewHexColor(0xb389f0)
 
-	colorGood = tcell.NewHexColor(0x7ee787)
-	colorWarn = tcell.NewHexColor(0xf2c94c)
-	colorCrit = tcell.NewHexColor(0xff6b6b)
+	colorGood  = tcell.NewHexColor(0x7ee787)
+	colorWarn  = tcell.NewHexColor(0xf2c94c)
+	colorCrit  = tcell.NewHexColor(0xff6b6b)
+	colorCache = tcell.NewHexColor(0xf2c94c) // reclaimable page cache/buffers segment in the RAM bar — distinct from "used"
 
 	colorText  = tcell.NewHexColor(0xe6e6e6)
 	colorMuted = tcell.NewHexColor(0x8b96a5)
@@ -60,7 +61,7 @@ func drawUI(s tcell.Screen, mon *SystemMonitor, app *AppState) {
 	renderFooterBar(s, Rect{0, h - footerH, w, footerH}, app)
 
 	mem := getMemStats()
-	renderKPIStrip(s, Rect{0, 1, w, 1}, mon, mem)
+	renderKPIStrip(s, Rect{0, 1, w, 1}, mon, mem, app)
 
 	body := Rect{0, 2, w, h - 2 - footerH}
 
@@ -124,7 +125,7 @@ func sumConstraintValues(cs []Constraint) int {
 	return total
 }
 
-func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats) {
+func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats, app *AppState) {
 	kpiBg := tcell.NewHexColor(0x141a26)
 	bg := tcell.StyleDefault.Background(kpiBg)
 	for x := area.X; x < area.X+area.W; x++ {
@@ -140,26 +141,38 @@ func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats)
 		totalCPU /= float32(len(usages))
 	}
 	ramPct := pct((mem.TotalKB-mem.AvailableKB)*1024, mem.TotalKB*1024)
+	cacheKB := mem.CacheKB()
+	if cacheKB > mem.TotalKB {
+		cacheKB = mem.TotalKB
+	}
+	var cacheFrac float32
+	if mem.TotalKB > 0 {
+		cacheFrac = float32(cacheKB) / float32(mem.TotalKB)
+	}
 
 	type gauge struct {
-		label string
-		value float32
-		style tcell.Style
+		label     string
+		value     float32
+		style     tcell.Style
+		cacheFrac float32
 	}
 	gauges := []gauge{
-		{"CPU", totalCPU, usageStyle(totalCPU)},
-		{"MEM", float32(ramPct), severityStyle(float64(ramPct), 70, 90)},
+		{"CPU", totalCPU, usageStyle(totalCPU), 0},
+		{"MEM", float32(ramPct), severityStyle(float64(ramPct), 70, 90), cacheFrac},
 	}
 	if usage, ok := getGPUUsage(); ok {
-		gauges = append(gauges, gauge{"GPU", usage, usageStyle(usage)})
+		gauges = append(gauges, gauge{"GPU", usage, usageStyle(usage), 0})
 	}
-	if loads := getNPULoad(); len(loads) > 0 {
-		var sum float32
-		for _, l := range loads {
-			sum += float32(l)
+	if app.hasNPU {
+		var avg float32
+		if loads := getNPULoad(); len(loads) > 0 {
+			var sum float32
+			for _, l := range loads {
+				sum += float32(l)
+			}
+			avg = sum / float32(len(loads))
 		}
-		avg := sum / float32(len(loads))
-		gauges = append(gauges, gauge{"NPU", avg, usageStyle(avg)})
+		gauges = append(gauges, gauge{"NPU", avg, usageStyle(avg), 0})
 	}
 
 	one, _, _ := getLoadAverage()
@@ -186,11 +199,15 @@ func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats)
 
 	var spans []Span
 	for _, g := range gauges {
-		spans = append(spans,
-			Span{Text: g.label + " ", Style: bg.Foreground(colorMuted)},
-			Span{Text: bar(barWidth, g.value/100.0), Style: g.style.Background(kpiBg)},
-			Span{Text: fmt.Sprintf(" %3.0f%%  ", g.value), Style: g.style.Background(kpiBg).Bold(true)},
-		)
+		spans = append(spans, Span{Text: g.label + " ", Style: bg.Foreground(colorMuted)})
+		if g.cacheFrac > 0 {
+			spans = append(spans, segmentedBar(barWidth,
+				[]float32{g.value / 100.0, g.cacheFrac},
+				[]tcell.Style{g.style.Background(kpiBg), tcell.StyleDefault.Background(kpiBg).Foreground(colorCache)})...)
+		} else {
+			spans = append(spans, Span{Text: bar(barWidth, g.value/100.0), Style: g.style.Background(kpiBg)})
+		}
+		spans = append(spans, Span{Text: fmt.Sprintf(" %3.0f%%  ", g.value), Style: g.style.Background(kpiBg).Bold(true)})
 	}
 	spans = append(spans,
 		Span{Text: "LOAD ", Style: bg.Foreground(colorMuted)},
@@ -424,6 +441,16 @@ func renderMemoryPanel(s tcell.Screen, area Rect, mem MemStats) {
 	swapTotal := mem.SwapTotalKB * 1024
 	swapUsed := (mem.SwapTotalKB - mem.SwapFreeKB) * 1024
 
+	// Cache/buffers are reclaimable, so they're excluded from "used" already
+	// (used = total - available, and available counts most of the cache as
+	// reclaimable). Show that cache as its own segment appended after used,
+	// clamped so it can't overrun the bar if total is stale/zero.
+	cacheKB := mem.CacheKB()
+	if cacheKB > mem.TotalKB {
+		cacheKB = mem.TotalKB
+	}
+	cache := cacheKB * 1024
+
 	ramPercent := pct(used, total)
 	swapPercent := pct(swapUsed, swapTotal)
 
@@ -435,17 +462,28 @@ func renderMemoryPanel(s tcell.Screen, area Rect, mem MemStats) {
 
 	barWidth := computeBarWidth(area.W-2, 35, 10, 50)
 
+	usedFrac, cacheFrac := float32(0), float32(0)
+	if total > 0 {
+		usedFrac = float32(used) / float32(total)
+		cacheFrac = float32(cache) / float32(total)
+	}
+	ramBar := []Span{{Text: "RAM  "}}
+	ramBar = append(ramBar, segmentedBar(barWidth,
+		[]float32{usedFrac, cacheFrac},
+		[]tcell.Style{severityStyle(float64(ramPercent), 70, 90), tcell.StyleDefault.Foreground(colorCache)})...)
+	combinedUsed := used + cache
+	combinedPercent := pct(combinedUsed, total)
+	ramBar = append(ramBar, Span{Text: fmt.Sprintf(" %3d%% | %s / %s",
+		combinedPercent, humanBytes(combinedUsed), humanBytes(total))})
+
 	lines := [][]Span{
 		{
 			{Text: "Total: "}, {Text: humanBytes(total), Style: styleWhite},
 			{Text: "  Free: "}, {Text: humanBytes(available), Style: styleWhite},
 			{Text: "  Used: "}, {Text: humanBytes(used), Style: styleWhite},
+			{Text: "  Cache: "}, {Text: humanBytes(cache), Style: tcell.StyleDefault.Foreground(colorCache)},
 		},
-		{
-			{Text: "RAM  "},
-			{Text: bar(barWidth, float32(ramPercent)/100.0), Style: severityStyle(float64(ramPercent), 70, 90)},
-			{Text: fmt.Sprintf(" %3d%% | %s / %s", ramPercent, humanBytes(used), humanBytes(total))},
-		},
+		ramBar,
 		{
 			{Text: "Swap "},
 			{Text: bar(barWidth, float32(swapPercent)/100.0), Style: severityStyle(float64(swapPercent), 40, 75)},

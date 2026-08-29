@@ -9,7 +9,7 @@ This is a Go port of [rktop](https://github.com/ajokela/rktop) by Alex Jokela, o
 ## Features
 
 - **CPU** — per-core usage, aggregate user/system/iowait/idle breakdown, frequency ranges per cluster, governor, context switch/interrupt/softirq rates, running/blocked process counts, load average
-- **Memory** — total/used/available RAM, swap, and ZRAM compression stats
+- **Memory** — total/used/available RAM, swap, and ZRAM compression stats; the RAM bar breaks out reclaimable page cache/buffers in a distinct color from true "used"
 - **GPU / NPU / RGA** — Mali GPU utilization and frequency, RKNPU per-core load and frequency, RGA per-scheduler load, with sparkline history for GPU/NPU
 - **Disk & Network I/O** — aggregate read/write throughput across physical disks, per-adapter RX/TX rates with IP addresses
 - **Temperatures** — all thermal zones plus GPU temperature via hwmon
@@ -56,6 +56,16 @@ sudo ./rkdash-linux-arm64
 sudo rkdash
 ```
 
+### MCP server mode
+
+Running with `--mcp` skips the TUI entirely and serves rkdash's readers as an [MCP](https://modelcontextprotocol.io) server over stdio, so an MCP client (an agent, an IDE) can query board telemetry:
+
+```sh
+rkdash --mcp
+```
+
+Tools exposed: `system_snapshot` (CPU/memory/swap/ZRAM/load/uptime), `hardware_info` (board identity, GPU/NPU utilization and frequency, thermal zones), `top_processes` (sorted by CPU or memory). Root is not required to start this mode, but debugfs-gated readings (GPU/NPU) will report as unavailable without it, same as the TUI.
+
 | Key         | Action                                             |
 |-------------|-----------------------------------------------------|
 | `↑` / `↓`   | Move process selection                              |
@@ -82,6 +92,7 @@ sudo rkdash
 | `filecache.go`     | Cached file descriptors for frequently-polled sysfs/debugfs paths     |
 | `canvas.go`        | Small terminal-layout/rendering primitives (rects, spans, splitting)  |
 | `ui.go`            | Panel rendering: header, CPU/memory/accelerator/I/O panels, process table, help overlay |
+| `mcpserver.go`     | MCP server mode (`--mcp`): exposes system/hardware readers as MCP tools over stdio |
 
 ## Refresh intervals
 
