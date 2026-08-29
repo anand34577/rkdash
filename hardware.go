@@ -347,7 +347,10 @@ func getNPUFrequency() (uint32, bool) {
 	return uint32(hz / 1_000_000), true
 }
 
-var npuLoadRe = regexp.MustCompile(`Core(\d+):\s*(\d+)%`)
+// Multi-core SoCs (e.g. RK3576) report "Core0: N%  Core1: N%"; single-core
+// SoCs (e.g. RK3566) report just "NPU load:  N%" with no core label.
+var npuLoadCoreRe = regexp.MustCompile(`Core(\d+):\s*(\d+)%`)
+var npuLoadSingleRe = regexp.MustCompile(`NPU load:\s*(\d+)%`)
 
 func getNPULoad() []uint8 {
 	content, err := readCachedFile("/sys/kernel/debug/rknpu/load")
@@ -355,10 +358,17 @@ func getNPULoad() []uint8 {
 		return nil
 	}
 	var loads []uint8
-	for _, m := range npuLoadRe.FindAllStringSubmatch(content, -1) {
+	for _, m := range npuLoadCoreRe.FindAllStringSubmatch(content, -1) {
 		v, err := strconv.ParseUint(m[2], 10, 8)
 		if err == nil {
 			loads = append(loads, uint8(v))
+		}
+	}
+	if len(loads) == 0 {
+		if m := npuLoadSingleRe.FindStringSubmatch(content); m != nil {
+			if v, err := strconv.ParseUint(m[1], 10, 8); err == nil {
+				loads = append(loads, uint8(v))
+			}
 		}
 	}
 	return loads

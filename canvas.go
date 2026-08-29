@@ -244,6 +244,38 @@ func computeBarWidth(innerW, reserved, min, max int) int {
 	return w
 }
 
+// segmentedBar renders width cells split across fracs (each 0..1, clamped and
+// capped so their sum never exceeds 1) as filled blocks in styles, with any
+// remainder left as the empty track. Used for bars that break "used" down
+// into sub-categories (e.g. RAM used vs. reclaimable cache).
+func segmentedBar(width int, fracs []float32, styles []tcell.Style) []Span {
+	if width < 0 {
+		width = 0
+	}
+	spans := make([]Span, 0, len(fracs)+1)
+	filledTotal := 0
+	for i, f := range fracs {
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		n := int(f * float32(width))
+		if filledTotal+n > width {
+			n = width - filledTotal
+		}
+		filledTotal += n
+		if n > 0 {
+			spans = append(spans, Span{Text: strings.Repeat("█", n), Style: styles[i]})
+		}
+	}
+	if filledTotal < width {
+		spans = append(spans, Span{Text: strings.Repeat("░", width-filledTotal)})
+	}
+	return spans
+}
+
 func bar(width int, fraction float32) string {
 	if fraction < 0 {
 		fraction = 0

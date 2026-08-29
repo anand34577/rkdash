@@ -149,7 +149,12 @@ func (m *SystemMonitor) CoreUsages() []float32 { return m.coreUsage }
 type MemStats struct {
 	TotalKB, FreeKB, AvailableKB uint64
 	SwapTotalKB, SwapFreeKB      uint64
+	CachedKB, BuffersKB          uint64
 }
+
+// CacheKB returns page cache + buffers: memory the kernel is holding for
+// speedup but will reclaim under pressure, so it shouldn't read as "used".
+func (m MemStats) CacheKB() uint64 { return m.CachedKB + m.BuffersKB }
 
 func getMemStats() MemStats {
 	var s MemStats
@@ -177,6 +182,10 @@ func getMemStats() MemStats {
 			s.SwapTotalKB = get(line)
 		case strings.HasPrefix(line, "SwapFree:"):
 			s.SwapFreeKB = get(line)
+		case strings.HasPrefix(line, "Buffers:"):
+			s.BuffersKB = get(line)
+		case strings.HasPrefix(line, "Cached:"):
+			s.CachedKB = get(line)
 		}
 	}
 	return s

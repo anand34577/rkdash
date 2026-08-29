@@ -23,6 +23,14 @@ func defaultRefreshConfig() RefreshConfig {
 }
 
 func main() {
+	if mcpFlag(os.Args[1:]) {
+		if err := runMCPServer(); err != nil {
+			fmt.Fprintln(os.Stderr, "MCP server error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if os.Geteuid() != 0 {
 		fmt.Fprintln(os.Stderr, "Root permissions required. Use: sudo rkdash")
 		os.Exit(1)
