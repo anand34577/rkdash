@@ -20,8 +20,11 @@ set GOOS=linux
 set GOARCH=arm64
 set CGO_ENABLED=0
 
-echo Building %OUT_FILE% (GOOS=%GOOS% GOARCH=%GOARCH%)...
-go build -trimpath -ldflags "-s -w" -o "%OUT_FILE%" .
+for /f %%v in ('git describe --tags --always --dirty 2^>nul') do set "VER=%%v"
+if not defined VER set "VER=dev"
+
+echo Building %OUT_FILE% (GOOS=%GOOS% GOARCH=%GOARCH%, version=%VER%)...
+go build -trimpath -ldflags "-s -w -X main.appVersion=%VER%" -o "%OUT_FILE%" .
 set "BUILD_ERR=%ERRORLEVEL%"
 
 popd

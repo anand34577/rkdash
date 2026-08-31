@@ -23,7 +23,7 @@ type AppState struct {
 	npuVersion, rgaVersion      string
 	rknnVersion, rkllmVersion   string
 
-	hasGPU, hasNPU, hasRGA bool
+	hasGPU, hasNPU, hasRGA, hasVPU bool
 
 	cpuFreqRanges    [][2]uint32
 	networkAdapters  []string
@@ -44,7 +44,7 @@ type AppState struct {
 
 	runningProcs, blockedProcs uint64
 
-	gpuHistory, npuHistory []float32
+	gpuHistory []float32
 
 	filterText string
 	filterMode bool
@@ -96,9 +96,13 @@ func NewAppState() *AppState {
 		prevCPUStatsTime: time.Now(),
 	}
 
-	_, a.hasGPU = getGPUUsage()
+	// Every supported SoC (RK3566/3576/3588) has a Mali GPU, so always show
+	// the panel rather than silently omitting it when neither the debugfs
+	// utilization node nor the devfreq node is wired up on this kernel.
+	a.hasGPU = true
 	a.hasNPU = len(getNPULoad()) > 0
 	a.hasRGA = len(getRGALoad()) > 0
+	a.hasVPU = len(getVPULoad()) > 0
 
 	return a
 }
@@ -111,17 +115,6 @@ func (a *AppState) updateHistory() {
 		}
 	}
 
-	if loads := getNPULoad(); len(loads) > 0 {
-		var sum float32
-		for _, l := range loads {
-			sum += float32(l)
-		}
-		avg := sum / float32(len(loads))
-		a.npuHistory = append(a.npuHistory, avg)
-		if len(a.npuHistory) > maxHistory {
-			a.npuHistory = a.npuHistory[1:]
-		}
-	}
 }
 
 func (a *AppState) updateCPUStats() {

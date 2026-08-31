@@ -3,10 +3,21 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 )
+
+// appVersion is overridable at build time via -ldflags "-X main.appVersion=x.y.z".
+var appVersion = "1.1.0-dev"
+
+// displayVersion normalizes appVersion to a single "v" prefix regardless of
+// whether the build already supplied one (e.g. from `git describe`, which
+// returns "v1.0.0-..." since the repo's tags are already "v"-prefixed).
+func displayVersion() string {
+	return "v" + strings.TrimPrefix(appVersion, "v")
+}
 
 type RefreshConfig struct {
 	CPUMemory   time.Duration
