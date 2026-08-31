@@ -2,6 +2,7 @@ package main
 
 import (
 	"debug/elf"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -241,30 +243,139 @@ func globFirst(patterns ...string) (string, bool) {
 }
 
 func getGPUUsage() (float32, bool) {
-	content, err := readCachedFile("/sys/kernel/debug/mali0/dvfs_utilization")
+	if content, err := readCachedFile("/sys/kernel/debug/mali0/dvfs_utilization"); err == nil {
+		parts := strings.Fields(content)
+		var busy, idle uint64
+		for i := 0; i+1 < len(parts); i += 2 {
+			key := strings.TrimSuffix(parts[i], ":")
+			val, err := strconv.ParseUint(parts[i+1], 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			switch key {
+			case "busy_time":
+				busy = val
+			case "idle_time":
+				idle = val
+			}
+		}
+		if total := busy + idle; total > 0 {
+			return float32(busy) / float32(total) * 100.0, true
+		}
+		return 0, false
+	}
+
+	// ponytail: fallback for kernels that expose a plain percentage instead
+	// of dvfs_utilization's busy/idle pair.
+	if content, err := readCachedFile("/sys/kernel/debug/mali0/utilization"); err == nil {
+		if m := regexp.MustCompile(`\d+`).FindString(content); m != "" {
+			if v, err := strconv.ParseUint(m, 10, 32); err == nil {
+				return float32(v), true
+			}
+		}
+	}
+	return 0, false
+}
+
+var dmcFreqPathCache string
+
+// getDMCFrequency reads the DDR memory controller's current clock, which
+// matters for video pipelines since decode/encode/display all share it.
+func getDMCFrequency() (uint32, bool) {
+	path := dmcFreqPathCache
+	if path == "" {
+		found, ok := globFirst("/sys/class/devfreq/dmc/cur_freq", "/sys/class/devfreq/*dmc*/cur_freq")
+		if !ok {
+			return 0, false
+		}
+		dmcFreqPathCache = found
+		path = found
+	}
+	content, err := readCachedFile(path)
 	if err != nil {
 		return 0, false
 	}
-	parts := strings.Fields(content)
-	var busy, idle uint64
-	for i := 0; i+1 < len(parts); i += 2 {
-		key := strings.TrimSuffix(parts[i], ":")
-		val, err := strconv.ParseUint(parts[i+1], 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		switch key {
-		case "busy_time":
-			busy = val
-		case "idle_time":
-			idle = val
-		}
-	}
-	total := busy + idle
-	if total == 0 {
+	hz, err := strconv.ParseUint(strings.TrimSpace(content), 10, 64)
+	if err != nil {
 		return 0, false
 	}
-	return float32(busy) / float32(total) * 100.0, true
+	return uint32(hz / 1_000_000), true
+}
+
+var vpuLoadIntervalOnce sync.Once
+
+// The mpp_service driver reports 0% until a sampling interval is armed —
+// cat /proc/mpp_service/load otherwise just prints instructions to do this.
+// Root is already required to run rkdash at all (see main.go), so this
+// write is always permitted.
+func ensureVPULoadInterval() {
+	vpuLoadIntervalOnce.Do(func() {
+		_ = os.WriteFile("/proc/mpp_service/load_interval", []byte("1000"), 0644)
+	})
+}
+
+// Device line, e.g. "fdf40000.rkvenc   load:   0.00% utilization:   0.00%".
+// The block set isn't fixed: RK3566/76/88 each report a different roster
+// (rkvenc, rkvdec, vepu, vdpu, jpegd/jpege, iep, avsd-plus, av1d, vdpp, ...),
+// and some SoCs report multiple instances of the same block name
+// (e.g. two "rkvenc-core" cores on RK3576) — so this parses whatever the
+// running kernel lists rather than matching against a whitelist.
+var vpuLoadLineRe = regexp.MustCompile(`(?i)^[0-9a-f]+\.([a-z0-9_-]+)\s+load:\s*([\d.]+)\s*%`)
+
+func getVPULoad() []namedLoad {
+	ensureVPULoadInterval()
+	content, err := readCachedFile("/proc/mpp_service/load")
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]int)
+	var result []namedLoad
+	for _, rawLine := range strings.Split(content, "\n") {
+		m := vpuLoadLineRe.FindStringSubmatch(strings.TrimSpace(rawLine))
+		if m == nil {
+			continue
+		}
+		load, err := strconv.ParseFloat(m[2], 32)
+		if err != nil {
+			continue
+		}
+		name := strings.ToLower(m[1])
+		idx := seen[name]
+		seen[name] = idx + 1
+		result = append(result, namedLoad{fmt.Sprintf("%s_%d", name, idx), float32(load)})
+	}
+	return result
+}
+
+var mppSessionDeviceRe = regexp.MustCompile(`(?i)[0-9a-f]+\.([a-z0-9_-]+)`)
+
+// ponytail: sessions-summary was empty (idle) on every board this was
+// verified against, so the exact column layout for an active session is
+// unconfirmed. Only trust an explicit "pid" field rather than guessing at
+// bare numbers, so a wrong column never gets mislabeled as a PID.
+var mppSessionPidRe = regexp.MustCompile(`(?i)pid[:=\s]+(\d+)`)
+
+// getMPPSessions maps each VPU block base name (without the "_N" instance
+// suffix getVPULoad adds) to the PIDs of processes currently holding a
+// session on it, from /proc/mpp_service/sessions-summary.
+func getMPPSessions() map[string][]int32 {
+	content, err := readCachedFile("/proc/mpp_service/sessions-summary")
+	if err != nil {
+		return nil
+	}
+	result := make(map[string][]int32)
+	for _, line := range strings.Split(content, "\n") {
+		nameM := mppSessionDeviceRe.FindStringSubmatch(line)
+		pidM := mppSessionPidRe.FindStringSubmatch(line)
+		if nameM == nil || pidM == nil {
+			continue
+		}
+		name := strings.ToLower(nameM[1])
+		if pid, err := strconv.ParseUint(pidM[1], 10, 32); err == nil {
+			result[name] = append(result[name], int32(pid))
+		}
+	}
+	return result
 }
 
 func getCPUFrequencies() []uint32 {
@@ -374,19 +485,21 @@ func getNPULoad() []uint8 {
 	return loads
 }
 
-func getRGALoad() []struct {
+// namedLoad is a device block name paired with its utilization percentage —
+// shared by every per-block accelerator load reader (RGA, VPU) so their
+// results can go through one shared grid renderer in ui.go.
+type namedLoad struct {
 	Name string
 	Load float32
-} {
+}
+
+func getRGALoad() []namedLoad {
 	content, err := readCachedFile("/sys/kernel/debug/rkrga/load")
 	if err != nil {
 		return nil
 	}
 
-	var result []struct {
-		Name string
-		Load float32
-	}
+	var result []namedLoad
 	currentScheduler := ""
 	schedulerIndex := 0
 
@@ -409,10 +522,7 @@ func getRGALoad() []struct {
 			if eq := strings.Index(line, "="); eq >= 0 {
 				loadStr := strings.TrimSpace(strings.ReplaceAll(line[eq+1:], "%", ""))
 				if load, err := strconv.ParseFloat(loadStr, 32); err == nil && currentScheduler != "" {
-					result = append(result, struct {
-						Name string
-						Load float32
-					}{currentScheduler, float32(load)})
+					result = append(result, namedLoad{currentScheduler, float32(load)})
 				}
 			}
 		}

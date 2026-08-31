@@ -21,8 +21,11 @@ try {
     $env:GOARCH = "arm64"
     $env:CGO_ENABLED = "0"
 
-    Write-Host "Building $outFile (GOOS=$($env:GOOS) GOARCH=$($env:GOARCH))..."
-    & go build -trimpath -ldflags "-s -w" -o $outFile .
+    $ver = (git describe --tags --always --dirty 2>$null)
+    if (-not $ver) { $ver = "dev" }
+
+    Write-Host "Building $outFile (GOOS=$($env:GOOS) GOARCH=$($env:GOARCH), version=$ver)..."
+    & go build -trimpath -ldflags "-s -w -X main.appVersion=$ver" -o $outFile .
     if ($LASTEXITCODE -ne 0) {
         throw "go build failed with exit code $LASTEXITCODE"
     }
