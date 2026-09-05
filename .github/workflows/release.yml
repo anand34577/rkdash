@@ -29,6 +29,21 @@ jobs:
       - run: go test ./...
       - run: GOOS=linux GOARCH=arm64 go vet ./...
 
+      # The installer runs as root on someone else's board; lint it like code.
+      # Findings are re-emitted as workflow annotations so they appear on the
+      # PR and in the checks API, rather than only inside the raw job log.
+      - name: Lint install.sh
+        run: |
+          sh -n install.sh
+          if ! shellcheck -f gcc -s sh install.sh > shellcheck.txt; then
+            sed -E \
+              -e 's/^([^:]+):([0-9]+):([0-9]+): note: (.*)$/::notice file=\1,line=\2,col=\3::\4/' \
+              -e 's/^([^:]+):([0-9]+):([0-9]+): warning: (.*)$/::warning file=\1,line=\2,col=\3::\4/' \
+              -e 's/^([^:]+):([0-9]+):([0-9]+): error: (.*)$/::error file=\1,line=\2,col=\3::\4/' \
+              shellcheck.txt
+            exit 1
+          fi
+
       - name: Build linux/arm64
         run: |
           version="${GITHUB_REF_NAME}"
@@ -49,3 +64,39 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+
+  # Actually run install.sh end to end on arm64 hardware — the download,
+  # checksum and update paths can't be exercised on the amd64 build runner,
+  # and a broken installer is invisible until someone tries it on a board.
+  install-test:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from the published release
+        run: sudo -E sh install.sh
+        env:
+          # On a tag run, verify the release this workflow just published;
+          # otherwise smoke-test against whatever is currently latest.
+          RKDASH_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - name: Binary is installed and runnable
+        run: |
+          command -v rkdash
+          # --json is the liveness probe rather than --version: on a non-tag run
+          # this installs whatever release is currently latest, which may predate
+          # any flag added on this branch. --json has shipped since v1.1.0 and
+          # needs no root, so it proves the binary actually executes on arm64.
+          rkdash --json > /dev/null
+          rkdash --version || echo "(installed release predates --version)"
+
+      - name: Re-running is a no-op update, not a failure
+        run: sudo -E sh install.sh
+        env:
+          RKDASH_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - name: Uninstall removes it
+        run: |
+          sudo sh install.sh --uninstall
+          if command -v rkdash; then echo "still installed"; exit 1; fi
