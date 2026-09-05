@@ -207,31 +207,6 @@ func drawTable(s tcell.Screen, r Rect, title string, header []Span, rows [][]Spa
 	}
 }
 
-func renderSparkline(data []float32, maxValue float32) string {
-	if len(data) == 0 {
-		return ""
-	}
-	blocks := []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
-	var b strings.Builder
-	for _, v := range data {
-		normalized := float32(0)
-		if maxValue > 0 {
-			normalized = v / maxValue
-			if normalized < 0 {
-				normalized = 0
-			}
-			if normalized > 1 {
-				normalized = 1
-			}
-		}
-		idx := int(normalized*float32(len(blocks)-1) + 0.5)
-		if idx >= len(blocks) {
-			idx = len(blocks) - 1
-		}
-		b.WriteRune(blocks[idx])
-	}
-	return b.String()
-}
 
 func computeBarWidth(innerW, reserved, min, max int) int {
 	w := innerW - reserved
@@ -276,16 +251,121 @@ func segmentedBar(width int, fracs []float32, styles []tcell.Style) []Span {
 	return spans
 }
 
-func bar(width int, fraction float32) string {
+// Eighth-width block runes: a bar of N cells resolves to 8N steps instead of
+// N, so a short bar stops jumping in 10% jerks.
+var eighthBlocks = []rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'}
+
+// gradStops is the meter gradient, low→high. Every cell of a bar is coloured
+// by its own position along the track (btop's look), so a full bar shows the
+// whole ramp rather than one flat severity colour.
+var gradStops = []int32{0x33c9a4, 0xf2c94c, 0xff6b6b}
+
+// useTruecolor gates 24-bit gradients. On an 8-colour TERM tcell quantises
+// every hex stop to roughly the same hue, so a gradient renders as one flat
+// block — the discrete fallback below stays readable there. Set once at
+// startup from the config.
+var useTruecolor = true
+
+// fallbackStops is the 8-colour approximation of gradStops, used when the
+// terminal can't do 24-bit.
+var fallbackStops = []tcell.Color{tcell.ColorGreen, tcell.ColorYellow, tcell.ColorRed}
+
+func gradientColor(t float64) tcell.Color {
+	if !useTruecolor {
+		switch {
+		case t < 0.6:
+			return fallbackStops[0]
+		case t < 0.85:
+			return fallbackStops[1]
+		default:
+			return fallbackStops[2]
+		}
+	}
+	switch {
+	case t <= 0:
+		return tcell.NewHexColor(gradStops[0])
+	case t >= 1:
+		return tcell.NewHexColor(gradStops[len(gradStops)-1])
+	}
+	seg := t * float64(len(gradStops)-1)
+	i := int(seg)
+	f := seg - float64(i)
+	a, b := gradStops[i], gradStops[i+1]
+	lerp := func(shift uint) int32 {
+		av := (a >> shift) & 0xff
+		bv := (b >> shift) & 0xff
+		return av + int32(f*float64(bv-av))
+	}
+	return tcell.NewHexColor(lerp(16)<<16 | lerp(8)<<8 | lerp(0))
+}
+
+// gradientBar draws a per-cell gradient meter with 1/8-cell resolution on top
+// of base (so callers with a panel background keep it). Replaces bar() at
+// every call site that wants the modern look.
+func gradientBar(width int, fraction float32, base tcell.Style) []Span {
+	if width <= 0 {
+		return nil
+	}
 	if fraction < 0 {
 		fraction = 0
 	}
 	if fraction > 1 {
 		fraction = 1
 	}
-	filled := int(fraction * float32(width))
-	if filled > width {
-		filled = width
+	denom := float64(width - 1)
+	if denom <= 0 {
+		denom = 1
 	}
-	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	exact := float64(fraction) * float64(width)
+	full := int(exact)
+	if full > width {
+		full = width
+	}
+
+	spans := make([]Span, 0, width+1)
+	for i := 0; i < full; i++ {
+		spans = append(spans, Span{"█", base.Foreground(gradientColor(float64(i) / denom))})
+	}
+	if full < width {
+		if eighth := int((exact - float64(full)) * 8); eighth > 0 {
+			spans = append(spans, Span{string(eighthBlocks[eighth]), base.Foreground(gradientColor(float64(full) / denom))})
+			full++
+		}
+	}
+	if full < width {
+		spans = append(spans, Span{strings.Repeat("░", width-full), base.Foreground(colorTrack)})
+	}
+	return spans
 }
+
+// graphSpans is renderSparkline with each column coloured by its own value,
+// so a history strip reads as a heat trace instead of a grey squiggle. Only
+// the trailing `width` samples are drawn.
+func graphSpans(data []float32, maxValue float32, width int, base tcell.Style) []Span {
+	if width <= 0 || maxValue <= 0 {
+		return nil
+	}
+	if len(data) > width {
+		data = data[len(data)-width:]
+	}
+	blocks := []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	spans := make([]Span, 0, width)
+	// Left-pad with empty track so the trace grows in from the right and the
+	// strip keeps a fixed width from the first frame.
+	if pad := width - len(data); pad > 0 {
+		spans = append(spans, Span{strings.Repeat("·", pad), base.Foreground(colorTrack)})
+	}
+	for _, v := range data {
+		n := float64(v / maxValue)
+		if n < 0 {
+			n = 0
+		}
+		if n > 1 {
+			n = 1
+		}
+		idx := int(n*float64(len(blocks)-1) + 0.5)
+		spans = append(spans, Span{string(blocks[idx]), base.Foreground(gradientColor(n))})
+	}
+	return spans
+}
+

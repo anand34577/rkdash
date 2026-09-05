@@ -1,0 +1,51 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed by the release step; ignored on non-tag runs
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs tags for the version stamp
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The package is Linux-only (/proc, /sys, unix.Statfs), so tests run
+      # natively on the amd64 runner; vet runs against the real target arch.
+      - run: go vet ./...
+      - run: go test ./...
+      - run: GOOS=linux GOARCH=arm64 go vet ./...
+
+      - name: Build linux/arm64
+        run: |
+          version="${GITHUB_REF_NAME}"
+          [ "${GITHUB_REF_TYPE}" = "tag" ] || version="$(git describe --tags --always --dirty)"
+          mkdir -p dist
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -trimpath -ldflags "-s -w -X main.appVersion=${version}" \
+            -o dist/rkdash-linux-arm64 .
+          cd dist && sha256sum rkdash-linux-arm64 > rkdash-linux-arm64.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rkdash-linux-arm64
+          path: dist/
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
