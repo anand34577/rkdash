@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -25,18 +26,36 @@ type RefreshConfig struct {
 	Processes   time.Duration
 }
 
-func defaultRefreshConfig() RefreshConfig {
+func refreshConfigFrom(c *Config) RefreshConfig {
 	return RefreshConfig{
-		CPUMemory:   1 * time.Second,
-		NetworkDisk: 2 * time.Second,
-		Processes:   2 * time.Second,
+		CPUMemory:   time.Duration(c.RefreshCPUMs) * time.Millisecond,
+		NetworkDisk: time.Duration(c.RefreshIOMs) * time.Millisecond,
+		Processes:   time.Duration(c.RefreshProcMs) * time.Millisecond,
 	}
 }
 
 func main() {
-	if mcpFlag(os.Args[1:]) {
+	var (
+		mcpMode    = flag.Bool("mcp", false, "run as an MCP server over stdio")
+		jsonMode   = flag.Bool("json", false, "print one JSON snapshot and exit")
+		jsonProcs  = flag.Int("json-procs", 0, "include this many top processes in --json output")
+		csvPath    = flag.String("csv", "", "append a sample row to this CSV file on every refresh")
+		configFlag = flag.String("config", "", "config file path (default $XDG_CONFIG_HOME/rkdash/rkdash.conf)")
+	)
+	flag.Parse()
+
+	// Both non-TUI modes are checked before the root/tcell setup so they work
+	// from a script without a terminal.
+	if *mcpMode || mcpFlag(os.Args[1:]) {
 		if err := runMCPServer(); err != nil {
 			fmt.Fprintln(os.Stderr, "MCP server error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *jsonMode {
+		if err := runJSONSnapshot(*jsonProcs); err != nil {
+			fmt.Fprintln(os.Stderr, "snapshot error:", err)
 			os.Exit(1)
 		}
 		return
@@ -46,6 +65,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Root permissions required. Use: sudo rkdash")
 		os.Exit(1)
 	}
+
+	cfg := LoadConfig(*configFlag)
+	useTruecolor = truecolorEnabled(cfg.Truecolor)
 
 	screen, err := tcell.NewScreen()
 	if err != nil {
@@ -61,7 +83,19 @@ func main() {
 	screen.SetStyle(styleDefault)
 
 	mon := NewSystemMonitor()
-	app := NewAppState()
+	app := NewAppState(cfg)
+
+	if *csvPath != "" {
+		rec, err := newCSVRecorder(*csvPath, app)
+		if err != nil {
+			screen.Fini()
+			fmt.Fprintln(os.Stderr, "Cannot open CSV file:", err)
+			os.Exit(1)
+		}
+		defer rec.Close()
+		app.recorder = rec
+		app.setStatus("Recording to " + *csvPath)
+	}
 
 	if err := runApp(screen, mon, app); err != nil {
 		screen.Fini()
@@ -71,7 +105,7 @@ func main() {
 }
 
 func runApp(screen tcell.Screen, mon *SystemMonitor, app *AppState) error {
-	config := defaultRefreshConfig()
+	config := refreshConfigFrom(app.cfg)
 
 	lastUpdate := time.Now()
 	lastNetworkUpdate := time.Now()
@@ -117,6 +151,10 @@ func runApp(screen tcell.Screen, mon *SystemMonitor, app *AppState) error {
 					return nil
 				}
 				draw()
+			case *tcell.EventMouse:
+				if handleMouse(app, e) {
+					draw()
+				}
 			}
 
 		case <-ticker.C:
@@ -128,7 +166,8 @@ func runApp(screen tcell.Screen, mon *SystemMonitor, app *AppState) error {
 					app.updateCPUStats()
 					app.updateStats()
 
-					app.updateHistory()
+					app.updateHistory(mon)
+					app.recorder.Sample(mon, app)
 
 					lastUpdate = time.Now()
 					shouldRender = true
@@ -157,6 +196,32 @@ func handleKey(app *AppState, ev *tcell.EventKey) bool {
 
 	if app.showHelp {
 		app.showHelp = false
+		return false
+	}
+
+	// The detail pane stays open while you arrow between processes; only Enter,
+	// Esc and q close it, and x still kills the process it's describing.
+	if app.showDetail {
+		switch ev.Key() {
+		case tcell.KeyEnter, tcell.KeyEscape:
+			app.showDetail = false
+			return false
+		case tcell.KeyUp:
+			moveSelection(app, -1)
+			return false
+		case tcell.KeyDown:
+			moveSelection(app, 1)
+			return false
+		}
+		switch ev.Rune() {
+		case 'q', 'Q':
+			app.showDetail = false
+		case 'x', 'X':
+			if app.selectedPid != 0 {
+				app.confirmingKill = true
+				app.killTargetName = app.selectedName
+			}
+		}
 		return false
 	}
 
@@ -201,11 +266,55 @@ func handleKey(app *AppState, ev *tcell.EventKey) bool {
 	case tcell.KeyDown:
 		moveSelection(app, 1)
 		return false
+	case tcell.KeyEnter:
+		if app.selectedPid != 0 {
+			app.showDetail = true
+		}
+		return false
+	case tcell.KeyPgUp:
+		moveSelection(app, -10)
+		return false
+	case tcell.KeyPgDn:
+		moveSelection(app, 10)
+		return false
+	}
+
+	// Digits 1..9,0 toggle panels in panelOrder; anything past the tenth panel
+	// is reachable only by editing the config, which is fine — the keyboard
+	// runs out before the panel list does.
+	if r := ev.Rune(); r >= '0' && r <= '9' {
+		idx := int(r - '1')
+		if r == '0' {
+			idx = 9
+		}
+		if idx >= 0 && idx < len(panelOrder) {
+			app.cfg.Toggle(panelOrder[idx])
+			app.setStatus("Toggled panel: " + panelOrder[idx])
+		}
+		return false
 	}
 
 	switch ev.Rune() {
 	case 'q', 'Q':
 		return true
+	case 'a', 'A':
+		app.accelOnly = !app.accelOnly
+		app.procScroll = 0
+		if app.accelOnly {
+			app.setStatus("Showing only NPU/VPU/RGA/GPU users")
+		} else {
+			app.setStatus("Showing all processes")
+		}
+	case 'b', 'B':
+		app.cfg.Badges = !app.cfg.Badges
+	case 'S':
+		app.cfg.Sort = sortModeName(app.processSortMode)
+		app.cfg.AccelOnly = app.accelOnly
+		if err := app.cfg.Save(); err != nil {
+			app.setStatus("Save failed: " + err.Error())
+		} else {
+			app.setStatus("Saved config to " + app.cfg.path)
+		}
 	case '/':
 		app.filterMode = true
 		app.filterText = ""
@@ -241,6 +350,34 @@ func handleKey(app *AppState, ev *tcell.EventKey) bool {
 			app.processSortMode = SortNameDesc
 		} else {
 			app.processSortMode = SortNameAsc
+		}
+	}
+	return false
+}
+
+// handleMouse gives the already-enabled mouse something to do: wheel scrolls
+// the process viewport, a click on a process row selects it. Reports whether
+// anything changed and a redraw is warranted.
+func handleMouse(app *AppState, ev *tcell.EventMouse) bool {
+	switch ev.Buttons() {
+	// Wheel moves the selection rather than the viewport directly — the
+	// viewport already follows the selection, so scrolling them independently
+	// would just fight the clamp in renderProcessPanel.
+	case tcell.WheelUp:
+		moveSelection(app, -3)
+		return true
+	case tcell.WheelDown:
+		moveSelection(app, 3)
+		return true
+	case tcell.Button1:
+		_, y := ev.Position()
+		row := y - app.procRowY
+		if row < 0 || row >= len(app.procRowPids) {
+			return false
+		}
+		if pid := app.procRowPids[row]; pid != 0 {
+			app.selectedPid = pid
+			return true
 		}
 	}
 	return false
