@@ -84,7 +84,12 @@ jobs:
       - name: Binary is installed and runnable
         run: |
           command -v rkdash
-          rkdash --version
+          # --json is the liveness probe rather than --version: on a non-tag run
+          # this installs whatever release is currently latest, which may predate
+          # any flag added on this branch. --json has shipped since v1.1.0 and
+          # needs no root, so it proves the binary actually executes on arm64.
+          rkdash --json > /dev/null
+          rkdash --version || echo "(installed release predates --version)"
 
       - name: Re-running is a no-op update, not a failure
         run: sudo -E sh install.sh
