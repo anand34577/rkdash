@@ -40,9 +40,17 @@ func main() {
 		jsonMode   = flag.Bool("json", false, "print one JSON snapshot and exit")
 		jsonProcs  = flag.Int("json-procs", 0, "include this many top processes in --json output")
 		csvPath    = flag.String("csv", "", "append a sample row to this CSV file on every refresh")
-		configFlag = flag.String("config", "", "config file path (default $XDG_CONFIG_HOME/rkdash/rkdash.conf)")
+		configFlag  = flag.String("config", "", "config file path (default $XDG_CONFIG_HOME/rkdash/rkdash.conf)")
+		versionMode = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	// Checked first and without the root gate: the installer calls this to
+	// report what's already on the box before replacing it.
+	if *versionMode {
+		fmt.Println(displayVersion())
+		return
+	}
 
 	// Both non-TUI modes are checked before the root/tcell setup so they work
 	// from a script without a terminal.

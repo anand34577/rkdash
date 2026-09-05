@@ -29,6 +29,12 @@ jobs:
       - run: go test ./...
       - run: GOOS=linux GOARCH=arm64 go vet ./...
 
+      # The installer runs as root on someone else's board; lint it like code.
+      - name: Lint install.sh
+        run: |
+          sh -n install.sh
+          shellcheck -s sh install.sh
+
       - name: Build linux/arm64
         run: |
           version="${GITHUB_REF_NAME}"
@@ -49,3 +55,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+
+  # Actually run install.sh end to end on arm64 hardware — the download,
+  # checksum and update paths can't be exercised on the amd64 build runner,
+  # and a broken installer is invisible until someone tries it on a board.
+  install-test:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from the published release
+        run: sudo -E sh install.sh
+        env:
+          # On a tag run, verify the release this workflow just published;
+          # otherwise smoke-test against whatever is currently latest.
+          RKDASH_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - name: Binary is installed and runnable
+        run: |
+          command -v rkdash
+          rkdash --version
+
+      - name: Re-running is a no-op update, not a failure
+        run: sudo -E sh install.sh
+        env:
+          RKDASH_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - name: Uninstall removes it
+        run: |
+          sudo sh install.sh --uninstall
+          if command -v rkdash; then echo "still installed"; exit 1; fi

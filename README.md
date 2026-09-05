@@ -31,7 +31,31 @@ This is a Go port of [rktop](https://github.com/ajokela/rktop) by Alex Jokela, o
 
 ## Installing
 
-Grab the prebuilt `linux/arm64` binary from the
+```sh
+curl -fsSL https://raw.githubusercontent.com/anand34577/rkdash/main/install.sh | sh
+```
+
+The script downloads the latest `linux/arm64` release, verifies its SHA-256, and installs it to `/usr/local/bin/rkdash`. Re-run the same command to update — it reports the version change and does nothing if you're already current.
+
+```sh
+# Uninstall (keeps your config; set RKDASH_PURGE=1 to delete that too)
+curl -fsSL https://raw.githubusercontent.com/anand34577/rkdash/main/install.sh | sh -s -- --uninstall
+
+# Pin a specific release
+curl -fsSL https://raw.githubusercontent.com/anand34577/rkdash/main/install.sh | sh -s -- --version v1.1.0
+```
+
+| Variable        | Effect                                              |
+|-----------------|-----------------------------------------------------|
+| `RKDASH_VERSION`| Install a specific tag instead of the latest        |
+| `RKDASH_PREFIX` | Install prefix (default `/usr/local`)               |
+| `RKDASH_PURGE`  | With `--uninstall`, also delete the config file     |
+
+The installer refuses to run on anything but Linux `aarch64`, and aborts rather than installing an unverified binary if the checksum doesn't match or no SHA-256 tool is available.
+
+### Manual install
+
+If you'd rather not pipe a script to a shell, take the binary straight from the
 [latest release](https://github.com/anand34577/rkdash/releases/latest):
 
 ```sh
@@ -132,6 +156,7 @@ sudo rkdash --csv /tmp/rknn-bench.csv
 | `accel.go`         | Accelerator device ownership, cpufreq throttling, cooling, per-disk I/O |
 | `detail.go`        | Per-process detail pane and its `/proc/<pid>` readers                 |
 | `export.go`        | `--json` snapshot and `--csv` recorder                                |
+| `install.sh`       | One-command install / update / uninstall from GitHub releases         |
 | `mcpserver.go`     | MCP server mode (`--mcp`): exposes system/hardware readers as MCP tools over stdio |
 
 ## Configuration

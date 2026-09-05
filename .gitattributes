@@ -1,0 +1,6 @@
+# Shell scripts and CI configs must keep LF endings regardless of the platform
+# they were edited on — a CRLF shebang makes the installer fail with a
+# confusing "not found" on the board.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
