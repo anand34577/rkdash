@@ -30,10 +30,19 @@ jobs:
       - run: GOOS=linux GOARCH=arm64 go vet ./...
 
       # The installer runs as root on someone else's board; lint it like code.
+      # Findings are re-emitted as workflow annotations so they appear on the
+      # PR and in the checks API, rather than only inside the raw job log.
       - name: Lint install.sh
         run: |
           sh -n install.sh
-          shellcheck -s sh install.sh
+          if ! shellcheck -f gcc -s sh install.sh > shellcheck.txt; then
+            sed -E \
+              -e 's/^([^:]+):([0-9]+):([0-9]+): note: (.*)$/::notice file=\1,line=\2,col=\3::\4/' \
+              -e 's/^([^:]+):([0-9]+):([0-9]+): warning: (.*)$/::warning file=\1,line=\2,col=\3::\4/' \
+              -e 's/^([^:]+):([0-9]+):([0-9]+): error: (.*)$/::error file=\1,line=\2,col=\3::\4/' \
+              shellcheck.txt
+            exit 1
+          fi
 
       - name: Build linux/arm64
         run: |

@@ -37,10 +37,12 @@ die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
 
 # Elevate per-command rather than re-executing the whole script under sudo:
 # re-exec would need the script on disk, and it arrives on stdin from a pipe.
+# A wrapper function rather than a $SUDO variable, so the command is never
+# subject to word splitting.
 if [ "$(id -u)" -eq 0 ]; then
-    SUDO=''
+    as_root() { "$@"; }
 elif command -v sudo >/dev/null 2>&1; then
-    SUDO='sudo'
+    as_root() { sudo "$@"; }
     info "Not running as root; will use sudo for $BIN_DIR"
 else
     die "Need root to write $BIN_DIR, and sudo is not installed. Re-run as root."
@@ -94,7 +96,6 @@ do_install() {
         base="https://github.com/$REPO/releases/download/$version"
         info "Installing rkdash $version"
     else
-        version="latest"
         base="https://github.com/$REPO/releases/latest/download"
         info "Installing the latest rkdash release"
     fi
@@ -108,7 +109,7 @@ do_install() {
     tmp=$(mktemp -d)
     # Clean up the download on any exit path, including a failed checksum.
     trap 'rm -rf "$tmp"' EXIT INT TERM
-    cd "$tmp"
+    cd "$tmp" || die "Cannot enter temp directory $tmp"
 
     info "Downloading $ASSET"
     fetch "$base/$ASSET" "$ASSET" \
@@ -120,13 +121,15 @@ do_install() {
     verify_checksum || die "Checksum mismatch — the download is corrupt or tampered with. Nothing was installed."
 
     chmod 755 "$ASSET"
-    $SUDO mkdir -p "$BIN_DIR"
+    as_root mkdir -p "$BIN_DIR"
     # install(1) replaces the file atomically, so a running rkdash isn't
     # corrupted mid-write and there's no window where the binary is missing.
     if command -v install >/dev/null 2>&1; then
-        $SUDO install -m 755 "$ASSET" "$TARGET"
+        as_root install -m 755 "$ASSET" "$TARGET"
     else
-        $SUDO cp "$ASSET" "$TARGET.new" && $SUDO chmod 755 "$TARGET.new" && $SUDO mv "$TARGET.new" "$TARGET"
+        as_root cp "$ASSET" "$TARGET.new"
+        as_root chmod 755 "$TARGET.new"
+        as_root mv "$TARGET.new" "$TARGET"
     fi
 
     installed=$("$TARGET" --version 2>/dev/null || echo "unknown")
@@ -154,7 +157,7 @@ do_uninstall() {
 
     if [ -e "$TARGET" ]; then
         info "Removing $TARGET"
-        $SUDO rm -f "$TARGET"
+        as_root rm -f "$TARGET"
         removed=1
     else
         warn "No binary at $TARGET"
@@ -172,7 +175,11 @@ do_uninstall() {
         fi
     fi
 
-    [ "$removed" -eq 1 ] && info "rkdash uninstalled" || info "Nothing to uninstall"
+    if [ "$removed" -eq 1 ]; then
+        info "rkdash uninstalled"
+    else
+        info "Nothing to uninstall"
+    fi
 }
 
 # ---------------------------------------------------------------- entry
