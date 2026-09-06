@@ -4,7 +4,7 @@ A terminal-based system monitor for Rockchip single-board computers (RK3566, RK3
 
 This is a Go port of [rktop](https://github.com/ajokela/rktop) by Alex Jokela, originally written in Rust with [Ratatui](https://ratatui.rs/). Panel layout, keybindings, and data sources mirror the original; this port reimplements them in Go with tcell instead of Ratatui/crossterm.
 
-![rkdash screenshot](screenshots/info.png)
+![rkdash screenshot](screenshots/rkdash-radxa-zero3e.png)
 
 ## Features
 
