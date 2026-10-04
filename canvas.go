@@ -120,10 +120,14 @@ const (
 	runeRoundedLR = '╯'
 )
 
-func drawBox(s tcell.Screen, r Rect, title string, style tcell.Style) Rect {
+// drawBox draws a rounded frame in the muted border colour with the title in
+// the panel's accent colour, so the data — not the chrome — carries the colour.
+// style's background is preserved so overlays keep their fill.
+func drawBox(s tcell.Screen, r Rect, title string, accent tcell.Style) Rect {
 	if r.W < 2 || r.H < 2 {
 		return Rect{r.X, r.Y, 0, 0}
 	}
+	style := accent.Foreground(colorBorder)
 	for x := r.X; x < r.X+r.W; x++ {
 		s.SetContent(x, r.Y, tcell.RuneHLine, nil, style)
 		s.SetContent(x, r.Y+r.H-1, tcell.RuneHLine, nil, style)
@@ -138,10 +142,19 @@ func drawBox(s tcell.Screen, r Rect, title string, style tcell.Style) Rect {
 	s.SetContent(r.X+r.W-1, r.Y+r.H-1, runeRoundedLR, nil, style)
 
 	if title != "" {
-		titleStyle := style.Bold(true)
-		drawText(s, r.X+2, r.Y, []Span{{Text: " " + title + " ", Style: titleStyle}}, r.W-4)
+		drawText(s, r.X+2, r.Y, []Span{{Text: " " + title + " ", Style: accent.Bold(true)}}, r.W-4)
 	}
 	return Rect{r.X + 1, r.Y + 1, r.W - 2, r.H - 2}
+}
+
+// panelBadge right-aligns a short status (e.g. "34%") on a box's top border.
+// It is skipped when the box is too narrow to fit it beside the title.
+func panelBadge(s tcell.Screen, r Rect, text string, style tcell.Style) {
+	w := len([]rune(text)) + 2
+	if r.H < 2 || r.W < w+16 {
+		return
+	}
+	drawText(s, r.X+r.W-w-2, r.Y, []Span{{Text: " " + text + " ", Style: style.Bold(true)}}, w)
 }
 
 func drawText(s tcell.Screen, x, y int, spans []Span, maxWidth int) {
@@ -175,38 +188,50 @@ func drawTable(s tcell.Screen, r Rect, title string, header []Span, rows [][]Spa
 		return
 	}
 
-	drawRow := func(y int, cells []Span, widths []int) {
+	drawRow := func(y int, cells []Span, widths []int, tint bool) {
 		x := inner.X
+		var last tcell.Style
 		for i, cell := range cells {
 			w := 10
 			if i < len(widths) {
 				w = widths[i]
 			}
+			if w <= 0 {
+				continue
+			}
+			st := cell.Style
+			if tint {
+				st = st.Background(colorBar)
+			}
+			last = st
 			runes := []rune(cell.Text)
 			if len(runes) > w {
 				runes = runes[:w]
 			}
-
-			text := string(runes) + strings.Repeat(" ", w-len(runes))
-			drawText(s, x, y, []Span{{Text: text, Style: cell.Style}}, w)
+			// The gap cell takes the same style so a selected row reads as one
+			// continuous bar instead of a stripe per column.
+			text := string(runes) + strings.Repeat(" ", w-len(runes)+1)
+			drawText(s, x, y, []Span{{Text: text, Style: st}}, minInt(w+1, inner.X+inner.W-x))
 			x += w + 1
+		}
+		for ; x < inner.X+inner.W; x++ {
+			s.SetContent(x, y, ' ', nil, last)
 		}
 	}
 
 	y := inner.Y
 	if header != nil {
-		drawRow(y, header, colWidths)
+		drawRow(y, header, colWidths, true)
 		y++
 	}
 	for _, row := range rows {
 		if y >= inner.Y+inner.H {
 			break
 		}
-		drawRow(y, row, colWidths)
+		drawRow(y, row, colWidths, false)
 		y++
 	}
 }
-
 
 func computeBarWidth(innerW, reserved, min, max int) int {
 	w := innerW - reserved

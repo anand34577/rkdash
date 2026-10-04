@@ -26,6 +26,8 @@ var (
 	colorTrack = tcell.NewHexColor(0x2a3140) // unfilled portion of every meter/graph
 	colorBar   = tcell.NewHexColor(0x1c2333)
 	colorSelBg = tcell.NewHexColor(0x3a2f5c)
+	colorBorder = tcell.NewHexColor(0x3a4a63) // panel frames: dim, so data carries the colour
+	colorKey    = tcell.NewHexColor(0x2a3550) // keycap pill behind footer shortcuts
 
 	styleInfo     = tcell.StyleDefault.Foreground(colorInfo)
 	styleAccel    = tcell.StyleDefault.Foreground(colorAccel)
@@ -53,8 +55,84 @@ func severityStyle(value, warn, crit float64) tcell.Style {
 func usageStyle(pct float32) tcell.Style  { return severityStyle(float64(pct), 60, 85) }
 func tempStyle(celsius int32) tcell.Style { return severityStyle(float64(celsius), 60, 80) }
 
+// Terminals smaller than this can't show anything useful; say so instead of
+// drawing a broken layout.
+const minTermW, minTermH = 40, 10
+
+// wideLayoutW is the width at which the top area splits into two columns;
+// below it every panel stacks in one column.
+const wideLayoutW = 100
+
+// panel is one top-area box: its exact height, a priority (lower = kept first
+// when the terminal is too short) and how to draw it.
+type panel struct {
+	h, minH, prio int
+	draw    func(Rect)
+}
+
+// A panel with minH < h can shrink to minH (its content is ordered most- to
+// least-important, so the box just clips the tail) before it is dropped.
+//
+// fitPanels drops the lowest-priority panels until the rest fit in budget rows,
+// keeping on-screen order. The top-priority panel is always kept, clamped to the
+// budget, so a short terminal degrades to "fewer panels", never "crushed boxes".
+func fitPanels(ps []panel, budget int) []panel {
+	order := make([]int, len(ps))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return ps[order[a]].prio < ps[order[b]].prio })
+	keep := make([]bool, len(ps))
+	used := 0
+	for n, i := range order {
+		switch {
+		case used+ps[i].h <= budget:
+			keep[i] = true
+			used += ps[i].h
+		case ps[i].minH > 0 && used+ps[i].minH <= budget:
+			keep[i] = true
+			ps[i].h = ps[i].minH
+			used += ps[i].h
+		case n == 0 && budget >= 3:
+			keep[i] = true
+			ps[i].h = budget
+			used = budget
+		}
+	}
+	var out []panel
+	for i, p := range ps {
+		if keep[i] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func panelsHeight(ps []panel) int {
+	n := 0
+	for _, p := range ps {
+		n += p.h
+	}
+	return n
+}
+
+func drawColumn(r Rect, ps []panel) {
+	cs := make([]Constraint, len(ps))
+	for i, p := range ps {
+		cs[i] = Length(p.h)
+	}
+	for i, rect := range splitVertical(r, cs) {
+		ps[i].draw(rect)
+	}
+}
+
 func drawUI(s tcell.Screen, mon *SystemMonitor, app *AppState) {
 	w, h := s.Size()
+	if w < minTermW || h < minTermH {
+		msg := fmt.Sprintf("rkdash: terminal too small (%dx%d, need %dx%d)", w, h, minTermW, minTermH)
+		drawText(s, maxInt((w-len([]rune(msg)))/2, 0), h/2, plain(msg), w)
+		return
+	}
 	const footerH = 1
 
 	renderHeaderBar(s, Rect{0, 0, w, 1}, app)
@@ -65,71 +143,87 @@ func drawUI(s tcell.Screen, mon *SystemMonitor, app *AppState) {
 
 	body := Rect{0, 2, w, h - 2 - footerH}
 
+	wide := w >= wideLayoutW
+	colW := w
+	if wide {
+		colW = w / 2
+	}
+	inW := colW - 2 // inner width of a top-area panel
+
 	numCores := len(mon.CoreUsages())
 	if numCores == 0 {
 		numCores = 1
 	}
-	coreRows := (numCores + 1) / 2
+	// One core per line once two columns of bars would be clipped.
+	cpuCols := 2
+	if inW < 58 {
+		cpuCols = 1
+	}
+	coreRows := (numCores + cpuCols - 1) / cpuCols
+	// Total + cores + User/Sys + Run lines, plus the Freq line when present.
+	cpuH := coreRows + 3 + 2
+	if len(app.cpuFreqRanges) > 0 {
+		cpuH++
+	}
 
-	// Each left-column panel contributes its height only when visible, so
-	// toggling one off gives its rows back to the rest of the screen instead
-	// of leaving a gap.
-	vis := func(name string, h int) int {
-		if app.cfg.Visible(name) {
-			return h
+	// A hidden or absent panel is simply not in the list, so toggling one off
+	// gives its rows back instead of leaving a gap.
+	mk := func(name string, present bool, prio, h, minH int, draw func(Rect)) []panel {
+		if !present || !app.cfg.Visible(name) {
+			return nil
 		}
-		return 0
+		return []panel{{h: h, minH: minH, prio: prio, draw: draw}}
 	}
-	memPanelHeight := vis("memory", 7)
-	ioNeeded := vis("io", gridRows(len(buildIORows(app)))+2)
-	tempNeeded := vis("temps", gridRows(len(buildTemperatureRows(app)))+2)
-	powerNeeded := vis("power", gridRows(len(buildPowerRows()))+2)
-	cpuNeeded := vis("cpu", coreRows+4+2)
-
-	leftNeeded := cpuNeeded + memPanelHeight + ioNeeded + tempNeeded + powerNeeded
-	rightNeeded := sumConstraintValues(rightPanelConstraints(app))
-
-	// Both columns are sized to exactly what their panels need (no
-	// stretch-to-fill Min panel absorbing slack into a near-empty box), so
-	// the shorter column just leaves plain background below its last panel
-	// — never an oversized bordered box with dead space inside it.
-	topNeeded := maxInt(leftNeeded, rightNeeded)
-
-	// Guarantee the Processes table below always gets a usable amount of
-	// room, even on a board whose accelerator panels alone would otherwise
-	// need more rows than the terminal has (e.g. RK3588's 13 VPU blocks) —
-	// clamp the top area rather than let it crowd Processes out entirely.
-	const minProcessRows = 8
-	if maxTop := body.H - minProcessRows; topNeeded > maxTop {
-		topNeeded = maxInt(maxTop, 0)
+	cat := func(groups ...[]panel) (out []panel) {
+		for _, g := range groups {
+			out = append(out, g...)
+		}
+		return
 	}
 
-	mainChunks := splitVertical(body, []Constraint{Length(topNeeded), Min(minProcessRows)})
-	topChunks := splitHorizontal(mainChunks[0], []Constraint{Percent(50), Percent(50)})
+	// prio is [wide, stacked]: the accelerators are the reason to run rkdash, so
+	// they outrank host chrome (SYS, Stats) when rows run out.
+	pr := func(wideP, stackP int) int {
+		if wide {
+			return wideP
+		}
+		return stackP
+	}
+	cpu := mk("cpu", true, pr(0, 0), cpuH, coreRows+3, func(r Rect) { renderCPUPanel(s, r, mon, app, cpuCols) })
+	memory := mk("memory", true, pr(1, 1), 7, 4, func(r Rect) { renderMemoryPanel(s, r, mem, app) })
+	io := mk("io", true, pr(2, 6), gridRows(len(buildIORows(app)), inW)+2, 0, func(r Rect) { renderIOPanel(s, r, app) })
+	temps := mk("temps", true, pr(3, 7), gridRows(len(buildTemperatureRows(app)), inW)+2, 0, func(r Rect) { renderTemperaturePanel(s, r, app) })
+	power := mk("power", true, pr(4, 8), gridRows(len(buildPowerRows()), inW)+2, 0, func(r Rect) { renderPowerPanel(s, r) })
+	sys := mk("sys", true, pr(4, 9), sysPanelHeight(inW), 0, func(r Rect) { renderSystemPanel(s, r, app) })
+	gpu := mk("gpu", app.hasGPU, pr(1, 3), gpuPanelHeight(app), 0, func(r Rect) { renderGPUPanel(s, r, app) })
+	npu := mk("npu", app.hasNPU && len(getNPULoad()) > 0, pr(0, 2), npuPanelHeight(inW), 0, func(r Rect) { renderNPUPanel(s, r, app, inW) })
+	rga := mk("rga", app.hasRGA && len(getRGALoad()) > 0, pr(2, 4), gridRows(len(getRGALoad()), inW)+2, 0, func(r Rect) { renderRGAPanel(s, r, app) })
+	vpu := mk("vpu", app.hasVPU && len(getVPULoad()) > 0, pr(3, 5), gridRows(len(getVPULoad()), inW)+2, 0, func(r Rect) { renderVPUPanel(s, r, app) })
+	stats := mk("stats", true, pr(5, 10), 7, 0, func(r Rect) { renderStatsPanel(s, r, app) })
 
-	leftCol := splitVertical(topChunks[0], []Constraint{
-		Length(cpuNeeded), Length(memPanelHeight), Length(ioNeeded),
-		Length(tempNeeded), Length(powerNeeded),
-	})
-	if cpuNeeded > 0 {
-		renderCPUPanel(s, leftCol[0], mon, app)
-	}
-	if memPanelHeight > 0 {
-		renderMemoryPanel(s, leftCol[1], mem, app)
-	}
-	if ioNeeded > 0 {
-		renderIOPanel(s, leftCol[2], app)
-	}
-	if tempNeeded > 0 {
-		renderTemperaturePanel(s, leftCol[3], app)
-	}
-	if powerNeeded > 0 {
-		renderPowerPanel(s, leftCol[4])
-	}
+	// Always leave the Processes table a usable slice of the screen, even on a
+	// board whose accelerator panels alone would fill the terminal (RK3588's 13
+	// VPU blocks).
+	minProcessRows := maxInt(6, minInt(10, body.H/3))
+	budget := maxInt(body.H-minProcessRows, 0)
 
-	renderRightPanels(s, topChunks[1], app, mon)
-
-	renderProcessPanel(s, mainChunks[1], mon, app)
+	var top Rect
+	if wide {
+		left := fitPanels(cat(cpu, memory, io, temps, power), budget)
+		right := fitPanels(cat(sys, gpu, npu, rga, vpu, stats), budget)
+		topH := maxInt(panelsHeight(left), panelsHeight(right))
+		chunks := splitVertical(body, []Constraint{Length(topH), Min(minProcessRows)})
+		top = chunks[0]
+		cols := splitHorizontal(top, []Constraint{Percent(50), Percent(50)})
+		drawColumn(cols[0], left)
+		drawColumn(cols[1], right)
+		renderProcessPanel(s, chunks[1], mon, app)
+	} else {
+		all := fitPanels(cat(cpu, memory, npu, gpu, rga, vpu, io, temps, power, sys, stats), budget)
+		chunks := splitVertical(body, []Constraint{Length(panelsHeight(all)), Min(minProcessRows)})
+		drawColumn(chunks[0], all)
+		renderProcessPanel(s, chunks[1], mon, app)
+	}
 
 	switch {
 	case app.showHelp:
@@ -137,37 +231,6 @@ func drawUI(s tcell.Screen, mon *SystemMonitor, app *AppState) {
 	case app.showDetail && app.selectedPid != 0:
 		renderDetailOverlay(s, Rect{0, 0, w, h}, app)
 	}
-}
-
-// rightPanelConstraints sizes every right-column panel to exactly what it
-// will render — no panel is padded past its content, so a short column
-// leaves plain background below it instead of one panel stretching into a
-// mostly-empty box.
-func rightPanelConstraints(app *AppState) []Constraint {
-	// A hidden panel contributes Length(0) rather than being dropped, so the
-	// index each panel renders into stays fixed regardless of what's toggled.
-	show := func(name string, present bool, h int) Constraint {
-		if present && app.cfg.Visible(name) {
-			return Length(h)
-		}
-		return Length(0)
-	}
-	return []Constraint{
-		show("sys", true, 8),
-		show("gpu", app.hasGPU, gpuPanelHeight(app)),
-		show("npu", app.hasNPU, npuPanelHeight()),
-		show("rga", app.hasRGA, gridRows(len(getRGALoad()))+2),
-		show("vpu", app.hasVPU, gridRows(len(getVPULoad()))+2),
-		show("stats", true, 7),
-	}
-}
-
-func sumConstraintValues(cs []Constraint) int {
-	total := 0
-	for _, c := range cs {
-		total += c.Value
-	}
-	return total
 }
 
 func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats, app *AppState) {
@@ -228,6 +291,10 @@ func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats,
 	loadFg, _, _ := severityStyle(one/float64(numCPUs)*100, 70, 100).Decompose()
 	loadText := fmt.Sprintf("LOAD %.2f ", one)
 
+	showLoad := area.W >= 64
+	if !showLoad {
+		loadText = ""
+	}
 	fixedWidth := len([]rune(loadText))
 	for _, g := range gauges {
 		fixedWidth += len(g.label) + 1 + 7
@@ -237,8 +304,8 @@ func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats,
 		if avail := area.W - fixedWidth; avail > 0 {
 			barWidth = avail / len(gauges)
 		}
-		if barWidth < 6 {
-			barWidth = 6
+		if barWidth < 4 {
+			barWidth = 4
 		}
 	}
 
@@ -254,10 +321,12 @@ func renderKPIStrip(s tcell.Screen, area Rect, mon *SystemMonitor, mem MemStats,
 		}
 		spans = append(spans, Span{Text: fmt.Sprintf(" %3.0f%%  ", g.value), Style: g.style.Background(kpiBg).Bold(true)})
 	}
-	spans = append(spans,
-		Span{Text: "LOAD ", Style: bg.Foreground(colorMuted)},
-		Span{Text: fmt.Sprintf("%.2f", one), Style: bg.Foreground(loadFg).Bold(true)},
-	)
+	if showLoad {
+		spans = append(spans,
+			Span{Text: "LOAD ", Style: bg.Foreground(colorMuted)},
+			Span{Text: fmt.Sprintf("%.2f", one), Style: bg.Foreground(loadFg).Bold(true)},
+		)
+	}
 
 	drawText(s, area.X, area.Y, spans, area.W)
 }
@@ -283,23 +352,43 @@ func renderHeaderBar(s tcell.Screen, area Rect, app *AppState) {
 	drawText(s, area.X, area.Y, left, area.W)
 
 	hostname := readTrimmed("/proc/sys/kernel/hostname", "")
-	var rightSpans []Span
-	if app.paused {
-		rightSpans = append(rightSpans, Span{Text: "PAUSED", Style: bg.Foreground(colorWarn).Bold(true)}, div)
-	}
-	if hostname != "" {
-		rightSpans = append(rightSpans, Span{Text: hostname, Style: bg.Foreground(colorMuted)}, div)
-	}
-	rightSpans = append(rightSpans, Span{Text: time.Now().Format("2006-01-02 15:04:05") + " ", Style: bg.Foreground(colorMuted)})
+	clock := Span{Text: time.Now().Format("2006-01-02 15:04:05") + " ", Style: bg.Foreground(colorMuted)}
+	paused := Span{Text: "PAUSED", Style: bg.Foreground(colorWarn).Bold(true)}
+	host := Span{Text: hostname, Style: bg.Foreground(colorMuted)}
 
-	width := 0
-	for _, sp := range rightSpans {
-		width += len([]rune(sp.Text))
+	// Drop the least important items until the right side fits beside the
+	// left: hostname first, then the date, finally everything but PAUSED.
+	leftW := spansWidth(left)
+	var candidates [][]Span
+	if hostname != "" {
+		candidates = append(candidates, []Span{host, div, clock})
 	}
-	x := area.X + area.W - width
-	if x > area.X {
-		drawText(s, x, area.Y, rightSpans, area.W)
+	short := Span{Text: time.Now().Format("15:04:05") + " ", Style: clock.Style}
+	candidates = append(candidates, []Span{clock}, []Span{short})
+	var rightSpans []Span
+	for _, c := range candidates {
+		if app.paused {
+			c = append([]Span{paused, div}, c...)
+		}
+		if leftW+spansWidth(c) < area.W {
+			rightSpans = c
+			break
+		}
 	}
+	if rightSpans == nil && app.paused {
+		rightSpans = []Span{paused, {Text: " ", Style: bg}}
+	}
+	if rightSpans != nil {
+		drawText(s, area.X+area.W-spansWidth(rightSpans), area.Y, rightSpans, area.W)
+	}
+}
+
+func spansWidth(sp []Span) int {
+	n := 0
+	for _, x := range sp {
+		n += len([]rune(x.Text))
+	}
+	return n
 }
 
 func renderFooterBar(s tcell.Screen, area Rect, app *AppState) {
@@ -327,43 +416,75 @@ func renderFooterBar(s tcell.Screen, area Rect, app *AppState) {
 		SortNameAsc: "Name↑", SortNameDesc: "Name↓",
 	}[app.processSortMode]
 
-	key := func(k string) Span { return Span{Text: k, Style: bg.Foreground(colorInfo).Bold(true)} }
-	label := func(l string) Span { return Span{Text: l, Style: bg.Foreground(colorMuted)} }
-	div := Span{Text: "│", Style: bg.Foreground(tcell.NewHexColor(0x3a4a63))}
-
-	line := []Span{
-		key("[C]"), label("PU "),
-		key("[M]"), label("em "),
-		key("[P]"), label("ID "),
-		key("[N]"), label("ame:"),
-		{Text: sortName + " ", Style: bg.Foreground(colorWarn).Bold(true)},
-		div,
-		key(" [/]"), label("Filter"),
+	// Each hint is a keycap plus a label; prio decides which survive when the
+	// terminal is too narrow for all of them (lowest dropped first).
+	type hint struct {
+		key, label string
+		labelStyle tcell.Style
+		prio       int
 	}
-	if app.filterMode {
-		line = append(line, label(": "), Span{Text: app.filterText, Style: bg.Foreground(colorWarn)}, Span{Text: "_", Style: bg.Foreground(colorWarn)})
-	} else if app.filterText != "" {
-		line = append(line, label(": "), Span{Text: app.filterText, Style: bg.Foreground(colorGood)})
+	muted := bg.Foreground(colorMuted)
+	hints := []hint{
+		{"c m p n", "Sort " + sortName, bg.Foreground(colorWarn).Bold(true), 6},
+		{"/", "Filter", muted, 5},
+		{"a", "Accel", muted, 3},
+		{"↵", "Detail", muted, 4},
+		{"x", "Kill", muted, 3},
+		{"␣", "Pause", muted, 2},
+		{"?", "Help", muted, 8},
+		{"q", "Quit", muted, 7},
 	}
-	line = append(line,
-		div,
-		key(" [a]"), label("ccel"),
-	)
+	if app.filterMode || app.filterText != "" {
+		hints[1].label = "Filter " + app.filterText
+		hints[1].labelStyle = bg.Foreground(colorGood)
+		if app.filterMode {
+			hints[1].label += "_"
+			hints[1].labelStyle = bg.Foreground(colorWarn)
+			hints[1].prio = 9
+		}
+	}
 	if app.accelOnly {
-		line = append(line, Span{Text: "*", Style: bg.Foreground(colorAccel).Bold(true)})
+		hints[2].label = "Accel*"
+		hints[2].labelStyle = bg.Foreground(colorAccel).Bold(true)
 	}
-	line = append(line,
-		div,
-		key(" [↵]"), label("Detail"),
-		div,
-		key(" [x]"), label("Kill"),
-		div,
-		key(" [Space]"), label("Pause"),
-		div,
-		key(" [?]"), label("Help"),
-		div,
-		key(" [Q]"), label("uit "),
-	)
+
+	hintW := func(h hint) int { return len([]rune(h.key)) + 2 + 1 + len([]rune(h.label)) + 2 }
+	keep := make([]bool, len(hints))
+	for i := range keep {
+		keep[i] = true
+	}
+	total := func() int {
+		n := 1
+		for i, h := range hints {
+			if keep[i] {
+				n += hintW(h)
+			}
+		}
+		return n
+	}
+	for total() > area.W {
+		drop := -1
+		for i, h := range hints {
+			if keep[i] && (drop < 0 || h.prio < hints[drop].prio) {
+				drop = i
+			}
+		}
+		if drop < 0 {
+			break
+		}
+		keep[drop] = false
+	}
+
+	line := []Span{{Text: " ", Style: bg}}
+	for i, h := range hints {
+		if !keep[i] {
+			continue
+		}
+		line = append(line,
+			Span{Text: " " + h.key + " ", Style: bg.Background(colorKey).Foreground(colorInfo).Bold(true)},
+			Span{Text: " " + h.label + "  ", Style: h.labelStyle},
+		)
+	}
 	drawText(s, area.X, area.Y, line, area.W)
 }
 
@@ -372,21 +493,24 @@ func renderHelpOverlay(s tcell.Screen, full Rect) {
 	overlayText := tcell.StyleDefault.Foreground(colorText).Background(overlayBg)
 	overlayMuted := tcell.StyleDefault.Foreground(colorMuted).Background(overlayBg)
 
-	line := func(s string) []Span { return []Span{{Text: s, Style: overlayText}} }
+	key := tcell.StyleDefault.Foreground(colorInfo).Bold(true).Background(overlayBg)
+	row := func(k, desc string) []Span {
+		return []Span{{Text: fmt.Sprintf("  %-10s", k), Style: key}, {Text: desc, Style: overlayText}}
+	}
 	lines := [][]Span{
-		line("Sort:      c/C  m/M  p/P  n/N   (press again to reverse)"),
-		line("Filter:    /  type to filter, Enter to confirm, Esc to clear"),
-		line("Accel:     a  show only NPU/VPU/RGA/GPU users   b  badge column"),
-		line("Navigate:  Up/Down, PgUp/PgDn   (list scrolls to follow)"),
-		line("Mouse:     click a row to select, wheel to scroll"),
-		line("Detail:    Enter  open the selected process's pane"),
-		line("Kill:      x  then y to confirm SIGTERM to the selected process"),
-		line("Panels:    1..9,0 toggle " + strings.Join(panelOrder[:minInt(10, len(panelOrder))], " ")),
-		line("Save:      S  write the current layout/sort to the config file"),
-		line("Pause:     Space     freeze all data refreshes"),
-		line("Quit:      q / Q"),
-		line(""),
-		{{Text: "Press any key to close", Style: overlayMuted}},
+		row("c m p n", "sort by CPU / Mem / PID / Name (press again to reverse)"),
+		row("/", "filter by name or user; Enter confirms, Esc clears"),
+		row("a  b", "accelerator-only filter / accelerator badge column"),
+		row("↑ ↓ PgUp", "move selection; the list scrolls to follow"),
+		row("click", "select a row; mouse wheel scrolls"),
+		row("Enter", "open the selected process's detail pane"),
+		row("x", "SIGTERM the selected process (y to confirm)"),
+		row("1..9 0", "toggle panels: "+strings.Join(panelOrder[:minInt(10, len(panelOrder))], " ")),
+		row("S", "save layout and sort to the config file"),
+		row("Space", "freeze all data refreshes"),
+		row("q", "quit"),
+		nil,
+		{{Text: "  Press any key to close", Style: overlayMuted}},
 	}
 
 	boxW := 72
@@ -413,7 +537,7 @@ func renderHelpOverlay(s tcell.Screen, full Rect) {
 	drawParagraph(s, area, "Keybindings", lines, tcell.StyleDefault.Foreground(colorProcess).Background(overlayBg))
 }
 
-func renderCPUPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppState) {
+func renderCPUPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppState, cols int) {
 	usages := mon.CoreUsages()
 	freqs := getCPUFrequencies()
 
@@ -429,6 +553,7 @@ func renderCPUPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppState
 	if inner.H == 0 {
 		return
 	}
+	panelBadge(s, area, fmt.Sprintf("%.0f%%", totalUsage), usageStyle(totalUsage))
 	y := inner.Y
 
 	writeLine := func(spans []Span) {
@@ -440,16 +565,16 @@ func renderCPUPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppState
 	}
 
 	totalLine := []Span{
-		{Text: "Total CPU: "},
+		{Text: "Total ", Style: styleGray},
 		{Text: fmt.Sprintf("%5.1f%% ", totalUsage), Style: usageStyle(totalUsage).Bold(true)},
 	}
 	totalLine = append(totalLine, graphSpans(app.cpuHistory, 100, inner.W-18, styleDefault)...)
 	writeLine(totalLine)
 
 	if len(usages) > 0 {
-		half := (len(usages) + 1) / 2
-		colW := inner.W / 2
-		barWidth := computeBarWidth(colW, 23, 8, 40)
+		half := (len(usages) + cols - 1) / cols
+		colW := inner.W / cols
+		barWidth := computeBarWidth(colW, 23, 6, 40)
 
 		coreLine := func(i int) []Span {
 			usage := usages[i]
@@ -457,7 +582,7 @@ func renderCPUPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppState
 			if i < len(freqs) {
 				freq = freqs[i]
 			}
-			spans := []Span{{Text: fmt.Sprintf("CPU %-2d ", i)}}
+			spans := []Span{{Text: fmt.Sprintf("CPU %-2d ", i), Style: styleGray}}
 			spans = append(spans, gradientBar(barWidth, usage/100.0, styleDefault)...)
 			return append(spans, Span{Text: fmt.Sprintf(" %3.0f%% %4d MHz", usage, freq)})
 		}
@@ -466,9 +591,11 @@ func renderCPUPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppState
 			if y >= inner.Y+inner.H {
 				break
 			}
-			drawText(s, inner.X, y, coreLine(row), colW)
-			if right := row + half; right < len(usages) {
-				drawText(s, inner.X+colW+1, y, coreLine(right), inner.W-colW-1)
+			for c := 0; c < cols; c++ {
+				if i := c*half + row; i < len(usages) {
+					x := inner.X + c*colW
+					drawText(s, x, y, coreLine(i), minInt(colW-1, inner.X+inner.W-x))
+				}
 			}
 			y++
 		}
@@ -525,40 +652,40 @@ func renderMemoryPanel(s tcell.Screen, area Rect, mem MemStats, app *AppState) {
 		usedFrac = float32(used) / float32(total)
 		cacheFrac = float32(cache) / float32(total)
 	}
-	ramBar := []Span{{Text: "RAM  "}}
+	ramBar := []Span{{Text: "RAM  ", Style: styleGray}}
 	ramBar = append(ramBar, segmentedBar(barWidth,
 		[]float32{usedFrac, cacheFrac},
 		[]tcell.Style{severityStyle(float64(ramPercent), 70, 90), tcell.StyleDefault.Foreground(colorCache)})...)
 	combinedUsed := used + cache
 	combinedPercent := pct(combinedUsed, total)
-	ramBar = append(ramBar, Span{Text: fmt.Sprintf(" %3d%% | %s / %s",
+	ramBar = append(ramBar, Span{Text: fmt.Sprintf(" %3d%%  %s / %s",
 		combinedPercent, humanBytes(combinedUsed), humanBytes(total))})
 
 	memLine := []Span{
-		{Text: "Total: "}, {Text: humanBytes(total), Style: styleWhite},
-		{Text: "  Free: "}, {Text: humanBytes(available), Style: styleWhite},
-		{Text: "  Used: "}, {Text: humanBytes(used), Style: styleWhite},
-		{Text: "  Cache: "}, {Text: humanBytes(cache), Style: tcell.StyleDefault.Foreground(colorCache)},
+		{Text: "Total ", Style: styleGray}, {Text: humanBytes(total), Style: styleWhite},
+		{Text: "  Free ", Style: styleGray}, {Text: humanBytes(available), Style: styleWhite},
+		{Text: "  Used ", Style: styleGray}, {Text: humanBytes(used), Style: styleWhite},
+		{Text: "  Cache ", Style: styleGray}, {Text: humanBytes(cache), Style: tcell.StyleDefault.Foreground(colorCache)},
 	}
 	if freq, ok := getDMCFrequency(); ok {
-		memLine = append(memLine, Span{Text: fmt.Sprintf("  DMC: %d MHz", freq), Style: styleWhite})
+		memLine = append(memLine, Span{Text: fmt.Sprintf("  DMC %d MHz", freq), Style: styleWhite})
 	}
 
 	lines := [][]Span{
 		memLine,
 		ramBar,
-		append(append([]Span{{Text: "Swap "}}, gradientBar(barWidth, float32(swapPercent)/100.0, styleDefault)...),
-			Span{Text: fmt.Sprintf(" %3d%% | %s / %s", swapPercent, humanBytes(swapUsed), humanBytes(swapTotal))}),
+		append(append([]Span{{Text: "Swap ", Style: styleGray}}, gradientBar(barWidth, float32(swapPercent)/100.0, styleDefault)...),
+			Span{Text: fmt.Sprintf(" %3d%%  %s / %s", swapPercent, humanBytes(swapUsed), humanBytes(swapTotal))}),
 	}
 
-	zramLine := append([]Span{{Text: "ZRAM "}}, gradientBar(barWidth, float32(zramPercent)/100.0, styleDefault)...)
+	zramLine := append([]Span{{Text: "ZRAM ", Style: styleGray}}, gradientBar(barWidth, float32(zramPercent)/100.0, styleDefault)...)
 	if hasZram {
 		ratio := zram.CompressionRatio()
 		ratioStr := "N/A"
 		if ratio > 0 {
 			ratioStr = fmt.Sprintf("%.1f", ratio)
 		}
-		zramLine = append(zramLine, Span{Text: fmt.Sprintf(" %3d%% | %s / %s (%sx)",
+		zramLine = append(zramLine, Span{Text: fmt.Sprintf(" %3d%%  %s / %s (%sx)",
 			zramPercent, humanBytes(zram.Used), humanBytes(zram.Limit), ratioStr)})
 	} else {
 		zramLine = append(zramLine, Span{Text: " N/A"})
@@ -568,41 +695,57 @@ func renderMemoryPanel(s tcell.Screen, area Rect, mem MemStats, app *AppState) {
 		graphSpans(app.memHistory, 100, area.W-8, styleDefault)...))
 
 	drawParagraph(s, area, "Memory", lines, styleInfo)
+	panelBadge(s, area, fmt.Sprintf("%d%%", combinedPercent), severityStyle(float64(combinedPercent), 70, 90))
 }
 
-func renderRightPanels(s tcell.Screen, area Rect, app *AppState, mon *SystemMonitor) {
-	// Positions match rightPanelConstraints exactly; a hidden panel gets a
-	// zero-height rect and drawBox declines to draw it.
-	chunks := splitVertical(area, rightPanelConstraints(app))
-	renderSystemPanel(s, chunks[0], app)
-	renderGPUPanel(s, chunks[1], app)
-	renderNPUPanel(s, chunks[2], app)
-	renderRGAPanel(s, chunks[3], app)
-	renderVPUPanel(s, chunks[4], app)
-	renderStatsPanel(s, chunks[5], app)
+// sysItems is the SYS panel's content as label/value pairs, so it can flow into
+// one or two columns depending on width.
+func sysItems(app *AppState) [][2]string {
+	return [][2]string{
+		{"Board", app.boardName},
+		{"SoC", app.rkModel},
+		{"Host", readTrimmed("/proc/sys/kernel/hostname", "Unknown")},
+		{"Kernel", readTrimmed("/proc/sys/kernel/osrelease", "Unknown")},
+		{"Arch", app.cpuArch},
+		{"NPU Driver", app.npuVersion},
+		{"RGA Driver", app.rgaVersion},
+		{"RKNN", app.rknnVersion},
+		{"RKLLM", app.rkllmVersion},
+	}
+}
+
+const sysItemCount = 9
+
+func sysPanelHeight(innerW int) int {
+	cols := 2
+	if innerW < 60 {
+		cols = 1
+	}
+	return (sysItemCount+cols-1)/cols + 2
 }
 
 func renderSystemPanel(s tcell.Screen, area Rect, app *AppState) {
-	hostname := readTrimmed("/proc/sys/kernel/hostname", "Unknown")
-	kernel := readTrimmed("/proc/sys/kernel/osrelease", "Unknown")
-
-	rowData := [][2]string{
-		{"Board: " + app.boardName, "Host: " + hostname},
-		{"SoC: " + app.rkModel, "Kernel: " + kernel},
-		{"NPU Driver:    " + app.npuVersion, "Arch: " + app.cpuArch},
-		{"RGA Driver:    " + app.rgaVersion, ""},
-		{"RKNN Runtime:  " + app.rknnVersion, ""},
-		{"RKLLM Runtime: " + app.rkllmVersion, ""},
+	inner := drawBox(s, area, "System", styleInfo)
+	if inner.H == 0 {
+		return
 	}
-
-	inner := drawBox(s, area, "SYS", styleInfo)
-	colW := inner.W / 2
-	for i, row := range rowData {
-		if i >= inner.H {
-			break
+	cols := 2
+	if inner.W < 60 {
+		cols = 1
+	}
+	items := sysItems(app)
+	rows := (len(items) + cols - 1) / cols
+	colW := inner.W / cols
+	for i, it := range items {
+		c, r := i/rows, i%rows
+		if r >= inner.H {
+			continue
 		}
-		drawText(s, inner.X, inner.Y+i, plain(row[0]), colW)
-		drawText(s, inner.X+colW+1, inner.Y+i, plain(row[1]), colW-1)
+		x := inner.X + c*colW
+		drawText(s, x, inner.Y+r, []Span{
+			{Text: fmt.Sprintf("%-11s ", it[0]), Style: styleGray},
+			{Text: it[1], Style: styleWhite},
+		}, minInt(colW-1, inner.X+inner.W-x))
 	}
 }
 
@@ -616,13 +759,13 @@ func renderGPUPanel(s tcell.Screen, area Rect, app *AppState) {
 	barWidth := computeBarWidth(area.W-2, 25, 10, 50)
 	var gpuLine []Span
 	if usageOK {
-		gpuLine = append([]Span{{Text: "Mali0 "}}, gradientBar(barWidth, usage/100.0, styleDefault)...)
+		gpuLine = append([]Span{{Text: "Mali0 ", Style: styleGray}}, gradientBar(barWidth, usage/100.0, styleDefault)...)
 		gpuLine = append(gpuLine, Span{Text: fmt.Sprintf(" %5.2f%%%s", usage, freqStr)})
 	} else {
 		// ponytail: Mali devfreq utilization node isn't wired up on this
 		// kernel build (common on RK3566 BSP kernels) — show clock only.
 		gpuLine = []Span{
-			{Text: "Mali0 "},
+			{Text: "Mali0 ", Style: styleGray},
 			{Text: "utilization N/A", Style: styleGray},
 			{Text: freqStr},
 		}
@@ -645,7 +788,7 @@ func gpuPanelHeight(app *AppState) int {
 	return h
 }
 
-func renderNPUPanel(s tcell.Screen, area Rect, app *AppState) {
+func renderNPUPanel(s tcell.Screen, area Rect, app *AppState, _ int) {
 	loads := getNPULoad()
 	if len(loads) == 0 {
 		return
@@ -660,8 +803,9 @@ func renderNPUPanel(s tcell.Screen, area Rect, app *AppState) {
 		return
 	}
 
-	half := gridRows(len(loads))
-	colW := inner.W / 2
+	cols := gridCols(len(loads), inner.W)
+	half := gridRows(len(loads), inner.W)
+	colW := inner.W / cols
 	barWidth := computeBarWidth(colW, 12, 8, 30)
 
 	coreLine := func(i int) []Span {
@@ -669,7 +813,7 @@ func renderNPUPanel(s tcell.Screen, area Rect, app *AppState) {
 		if i == 0 {
 			suffix = freqStr
 		}
-		spans := []Span{{Text: fmt.Sprintf("Core %d ", i)}}
+		spans := []Span{{Text: fmt.Sprintf("Core %d ", i), Style: styleGray}}
 		spans = append(spans, gradientBar(barWidth, float32(loads[i])/100.0, styleDefault)...)
 		spans = append(spans, Span{Text: fmt.Sprintf(" %3d%%%s", loads[i], suffix)})
 		if h := app.accelHistory[fmt.Sprintf("npu:%d", i)]; len(h) > 0 {
@@ -686,9 +830,11 @@ func renderNPUPanel(s tcell.Screen, area Rect, app *AppState) {
 		if y >= inner.Y+inner.H {
 			break
 		}
-		drawText(s, inner.X, y, coreLine(row), colW)
-		if right := row + half; right < len(loads) {
-			drawText(s, inner.X+colW+1, y, coreLine(right), inner.W-colW-1)
+		for c := 0; c < cols; c++ {
+			if i := c*half + row; i < len(loads) {
+				x := inner.X + c*colW
+				drawText(s, x, y, coreLine(i), minInt(colW-1, inner.X+inner.W-x))
+			}
 		}
 		y++
 	}
@@ -697,25 +843,28 @@ func renderNPUPanel(s tcell.Screen, area Rect, app *AppState) {
 // npuPanelHeight is the exact box height renderNPUPanel needs — border plus
 // its core rows, nothing more — so the layout never reserves blank space
 // for it.
-func npuPanelHeight() int { return gridRows(len(getNPULoad())) + 2 }
+func npuPanelHeight(innerW int) int { return gridRows(len(getNPULoad()), innerW) + 2 }
 
-// gridCols picks how many items renderLoadGrid/renderLabelGrid pack per
-// row: 3 once a panel has enough entries that 2 columns would still run
-// tall (RK3588 reports 13 VPU blocks; RK3577's I/O panel lists ~14 rows
-// across disks/interfaces), 2 otherwise.
-func gridCols(n int) int {
+// gridCols picks how many items renderLoadGrid/renderLabelGrid pack per row
+// in a panel innerW cells wide: 3 once there are enough entries that 2 columns
+// would still run tall (RK3588 reports 13 VPU blocks), 2 otherwise — but never
+// so many that a column drops under ~34 cells and starts clipping its values.
+func gridCols(n, innerW int) int {
+	cols := 2
 	if n > 8 {
-		return 3
+		cols = 3
 	}
-	return 2
+	for cols > 1 && innerW/cols < 34 {
+		cols--
+	}
+	return cols
 }
 
-// gridRows is the row count a gridCols(n)-column grid needs for n items —
-// right-column panel constraints size against this so the box height
-// always matches what actually gets drawn.
-func gridRows(n int) int {
+// gridRows is the row count a gridCols-column grid needs for n items — panel
+// heights are sized against this so the box always matches what gets drawn.
+func gridRows(n, innerW int) int {
 	n = maxInt(n, 1)
-	cols := gridCols(n)
+	cols := gridCols(n, innerW)
 	return (n + cols - 1) / cols
 }
 
@@ -734,8 +883,8 @@ func renderLoadGrid(s tcell.Screen, area Rect, title string, style tcell.Style, 
 		return
 	}
 
-	cols := gridCols(len(loads))
-	rows := gridRows(len(loads))
+	cols := gridCols(len(loads), inner.W)
+	rows := gridRows(len(loads), inner.W)
 	colW := inner.W / cols
 	nameWidth := 8
 	for _, l := range loads {
@@ -746,7 +895,7 @@ func renderLoadGrid(s tcell.Screen, area Rect, title string, style tcell.Style, 
 	barWidth := computeBarWidth(colW, nameWidth+14, 6, 30)
 
 	itemLine := func(l namedLoad, w int) []Span {
-		spans := []Span{{Text: fmt.Sprintf("%-*s ", nameWidth, l.Name)}}
+		spans := []Span{{Text: fmt.Sprintf("%-*s ", nameWidth, l.Name), Style: styleGray}}
 		spans = append(spans, gradientBar(barWidth, l.Load/100.0, styleDefault)...)
 		spans = append(spans, Span{Text: fmt.Sprintf(" %5.1f%%", l.Load)})
 		// Trailing history trace in whatever width is left — the accelerator
@@ -831,18 +980,23 @@ func renderStatsPanel(s tcell.Screen, area Rect, app *AppState) {
 	loadPct := one / float64(numCPUs) * 100
 
 	lines := [][]Span{
-		plain(fmt.Sprintf("Uptime:     %s", uptimeStr)),
-		{
-			{Text: "Load Avg:   "},
-			{Text: fmt.Sprintf("%.2f", one), Style: severityStyle(loadPct, 70, 100)},
-			{Text: fmt.Sprintf(" %.2f %.2f", five, fifteen)},
-		},
-		plain(fmt.Sprintf("Governor:   %s", app.cpuGovernor)),
-		plain(fmt.Sprintf("Processes:  %d", totalProcesses)),
-		plain(fmt.Sprintf("TCP Conns:  %d", app.tcpConnections)),
+		kv("Uptime", plain(uptimeStr)),
+		kv("Load avg", []Span{
+			{Text: fmt.Sprintf("%.2f", one), Style: severityStyle(loadPct, 70, 100).Bold(true)},
+			{Text: fmt.Sprintf("  %.2f  %.2f", five, fifteen)},
+		}),
+		kv("Governor", plain(app.cpuGovernor)),
+		kv("Processes", plain(fmt.Sprintf("%d", totalProcesses))),
+		kv("TCP conns", plain(fmt.Sprintf("%d", app.tcpConnections))),
 	}
 
 	drawParagraph(s, area, "Stats", lines, styleInfo)
+}
+
+// kv is a muted, fixed-width label followed by its value spans, so stacked
+// lines align on the value column.
+func kv(label string, value []Span) []Span {
+	return append([]Span{{Text: fmt.Sprintf("%-10s ", label), Style: styleGray}}, value...)
 }
 
 // labelValue is a name/value pair for the dense label:value grid panels
@@ -868,8 +1022,8 @@ func renderLabelGrid(s tcell.Screen, area Rect, title string, style tcell.Style,
 		return
 	}
 
-	cols := gridCols(len(rows))
-	gridH := gridRows(len(rows))
+	cols := gridCols(len(rows), inner.W)
+	gridH := gridRows(len(rows), inner.W)
 	colW := inner.W / cols
 	labelWidth := 8
 	for _, r := range rows {
@@ -1213,18 +1367,46 @@ func renderProcessPanel(s tcell.Screen, area Rect, mon *SystemMonitor, app *AppS
 		{Text: memText, Style: memStyle},
 	}
 
-	// Accel column collapses to zero when badges are off, so the name column
-	// gets those cells back rather than the table carrying a blank strip.
-	accelW := 0
-	if app.cfg.Badges || app.accelOnly {
-		accelW = 11
+	// Columns drop out as the terminal narrows (least important first) so the
+	// Name column always keeps a readable share. Index 8 (Name) absorbs the
+	// leftover width. minW is the terminal width a column needs to appear.
+	accelOn := app.cfg.Badges || app.accelOnly
+	cols := []struct{ w, minW int }{
+		{9, 0}, {9, 72}, {1, 96}, {3, 104}, {2, 104}, {3, 90}, {9, 82}, {11, 60}, {0, 0}, {6, 0}, {6, 0},
 	}
-	fixedColsWidth := 9 + 9 + 1 + 3 + 2 + 3 + 9 + accelW + 6 + 6
-	const numGaps = 10
-	nameWidth := maxInt(area.W-fixedColsWidth-numGaps, 10)
-	colWidths := []int{9, 9, 1, 3, 2, 3, 9, accelW, nameWidth, 6, 6}
+	var keep []int
+	used := 0
+	for i, c := range cols {
+		if i == 7 && !accelOn || i != 8 && area.W < c.minW {
+			continue
+		}
+		keep = append(keep, i)
+		used += c.w + 1
+	}
+	nameWidth := maxInt(area.W-2-used, 6)
+	widths := make([]int, 0, len(keep))
+	pick := func(cells []Span) []Span {
+		out := make([]Span, 0, len(keep))
+		for _, i := range keep {
+			if i < len(cells) {
+				out = append(out, cells[i])
+			}
+		}
+		return out
+	}
+	for _, i := range keep {
+		if i == 8 {
+			widths = append(widths, nameWidth)
+		} else {
+			widths = append(widths, cols[i].w)
+		}
+	}
+	for i := range rows {
+		rows[i] = pick(rows[i])
+	}
 
-	drawTable(s, area, "Processes", header, rows, colWidths, styleProcess, styleBold)
+	drawTable(s, area, "Processes", pick(header), rows, widths, styleProcess, styleBold)
+	panelBadge(s, area, fmt.Sprintf("%d shown", len(visiblePids)), styleProcess)
 }
 
 // clampScroll returns the viewport offset that keeps row selRow (-1 for no
