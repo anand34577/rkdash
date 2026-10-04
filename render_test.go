@@ -134,3 +134,42 @@ func TestClampScrollKeepsSelectionVisible(t *testing.T) {
 		t.Errorf("no selection should leave scroll alone, got %d", got)
 	}
 }
+
+func TestFitPanels(t *testing.T) {
+	mk := func(h, minH, prio int) panel { return panel{h: h, minH: minH, prio: prio} }
+	total := func(ps []panel) int { return panelsHeight(ps) }
+
+	ps := []panel{mk(8, 0, 0), mk(7, 4, 1), mk(5, 0, 2), mk(3, 0, 3)}
+	for budget := 0; budget < 30; budget++ {
+		got := fitPanels(append([]panel(nil), ps...), budget)
+		if total(got) > budget {
+			t.Fatalf("budget %d: panels use %d rows", budget, total(got))
+		}
+	}
+	// Lowest priority goes first; a shrinkable panel shrinks before being dropped.
+	got := fitPanels(append([]panel(nil), ps...), 12)
+	if len(got) != 2 || got[1].h != 4 {
+		t.Fatalf("want CPU + shrunk memory, got %+v", got)
+	}
+	// Even a tiny budget keeps the top-priority panel, clamped.
+	if got := fitPanels(append([]panel(nil), ps...), 5); len(got) != 1 || got[0].h != 5 {
+		t.Fatalf("top panel should be clamped to budget, got %+v", got)
+	}
+	// On-screen order is preserved regardless of priority.
+	got = fitPanels([]panel{mk(3, 0, 5), mk(3, 0, 1)}, 100)
+	if got[0].prio != 5 {
+		t.Error("fitPanels reordered panels")
+	}
+}
+
+func TestGridColsNarrowing(t *testing.T) {
+	if gridCols(13, 120) != 3 || gridCols(4, 120) != 2 {
+		t.Error("wide panels keep their normal column count")
+	}
+	if gridCols(13, 60) != 1 || gridCols(13, 80) != 2 {
+		t.Errorf("narrow panels must shed columns: %d %d", gridCols(13, 60), gridCols(13, 80))
+	}
+	if gridRows(13, 60) != 13 || gridRows(0, 60) != 1 {
+		t.Error("gridRows must match gridCols")
+	}
+}
