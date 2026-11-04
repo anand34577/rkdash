@@ -203,6 +203,25 @@ go run ./tools/stripcomments -dir . -write
 
 It only touches `*.go` files directly inside the given `-dir` (non-recursive) and skips `_test.go` files.
 
+### Panthor GPU utilization (mainline RK3588)
+
+On Panthor kernels, rkdash falls back from the vendor Mali debugfs counters to
+`drm-engine-panthor` timestamps in `/proc/<pid>/fdinfo/<fd>`. Run with `sudo` to
+include all clients and enable timestamp profiling automatically through the
+GPU's `profiling` sysfs attribute. Existing profiling bits are preserved. This
+runtime setting stays enabled until reboot; rkdash does not modify boot files.
+To disable it manually after monitoring, restore the previous profiling mask
+(e.g. `echo 0 | sudo tee /sys/bus/platform/devices/fb000000.gpu/profiling` if it
+was originally zero).
+
+The first refresh establishes a baseline. Subsequent values estimate activity
+as the sum of client job-time deltas divided by elapsed time, capped at 100%.
+Shared DRM clients are counted once, new/reset counters establish a fresh
+baseline, and missing/inaccessible timestamps produce `N/A`. Concurrent jobs
+may overlap, so this is an activity estimate, not exact hardware occupancy.
+JSON snapshots take an initial ~550 ms sample on Panthor. Legacy Mali readers
+continue to work unchanged.
+
 ## License
 
 BSD 3-Clause, inherited from the upstream [rktop](https://github.com/ajokela/rktop) project (Copyright (c) 2025, Alex Jokela and contributors). See [LICENSE](LICENSE).

@@ -44,6 +44,7 @@ func buildSnapshot(mon *SystemMonitor, topN int) Snapshot {
 // runJSONSnapshot prints one snapshot and exits — for scripting and for
 // benchmarking an RKNN model from a shell loop.
 func runJSONSnapshot(topN int) error {
+	primePanthorSnapshot()
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(buildSnapshot(NewSystemMonitor(), topN))
