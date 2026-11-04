@@ -274,7 +274,7 @@ func getGPUUsage() (float32, bool) {
 			}
 		}
 	}
-	return 0, false
+	return getPanthorGPUUsage()
 }
 
 var dmcFreqPathCache string
